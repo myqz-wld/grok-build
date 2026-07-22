@@ -1,4 +1,5 @@
 //! Tests for the dispatch module tree: shared fixtures and per-domain test modules.
+mod annotations;
 mod auth;
 mod billing;
 mod cta_e2e;

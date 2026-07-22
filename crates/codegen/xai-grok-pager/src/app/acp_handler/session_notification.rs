@@ -101,6 +101,24 @@ pub(super) fn advance_reconnect_cursor(agent: &mut AgentView, meta: &mut Notific
         agent.last_seen_event_id = Some(id);
     }
 }
+
+/// Prompt attribution carried inside durable xAI payloads. Older persisted
+/// terminals may predate `_meta.promptId`, so payload identity must be
+/// considered before session-id ownership is resolved.
+fn update_prompt_id(update: &XaiSessionUpdate) -> Option<&str> {
+    let prompt_id = match update {
+        XaiSessionUpdate::TurnCompleted { prompt_id, .. } => Some(prompt_id),
+        XaiSessionUpdate::HookExecution {
+            prompt_id: Some(prompt_id),
+            ..
+        } => Some(prompt_id),
+        _ => None,
+    };
+    prompt_id
+        .map(String::as_str)
+        .filter(|prompt_id| !prompt_id.is_empty())
+}
+
 /// Handle `x.ai/session_notification` and replay-path `x.ai/session/update`.
 ///
 /// Routes by `session_id` so events for an inactive agent still mutate that
@@ -127,17 +145,21 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         _ => {}
     }
     let is_api_key_auth = app.is_api_key_auth;
-    let matched = match find_session_match(app, &session_notif.session_id) {
-        Some(m) => m,
-        None => {
-            tracing::debug!(
-                session_id = session_notif.session_id.0.as_ref(),
-                method = notif.method.as_ref(),
-                "load-race: x.ai/session_notification DROPPED — no agent matches session_id"
-            );
-            return false;
-        }
-    };
+    let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
+    let routing_prompt_id =
+        update_prompt_id(&session_notif.update).or_else(|| meta.prompt_id.as_deref());
+    let matched =
+        match find_session_match_for_prompt(app, &session_notif.session_id, routing_prompt_id) {
+            Some(m) => m,
+            None => {
+                tracing::debug!(
+                    session_id = session_notif.session_id.0.as_ref(),
+                    method = notif.method.as_ref(),
+                    "load-race: x.ai/session_notification DROPPED — no agent matches session_id"
+                );
+                return false;
+            }
+        };
     let parent_id = matched.agent_id();
     let is_active = is_matched_agent_active(app, parent_id);
     if matches!(matched, SessionMatch::Annotation { .. }) {
@@ -160,7 +182,6 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         );
         return changed && is_active;
     }
-    let meta = NotificationMeta::from_json(session_notif.meta.as_ref().and_then(|v| v.as_object()));
     if drop_unexpected_replay(
         agent,
         &meta,

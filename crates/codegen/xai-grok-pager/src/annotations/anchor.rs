@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::scrollback::RenderBlock;
 use crate::scrollback::state::ScrollbackState;
-use crate::scrollback::text_selection::ActiveTextDrag;
-use crate::scrollback::types::BlockLine;
+use crate::scrollback::text_selection::{ActiveTextDrag, SelectionKind};
+use crate::scrollback::types::{BlockLine, block_line_selectable_width, selectable_cols};
 
 /// Transcript roles eligible for V1 inline annotations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -313,19 +313,13 @@ pub fn build_annotation_anchor(
         return Err(AnnotationSelectionError::InvalidRenderedRange);
     }
 
-    let mut source_lines = block_lines[start..=end]
-        .iter()
-        .filter(|line| line.selection_range == Some(selection.anchor.range_id))
-        .map(|line| {
-            line.source_line
-                .ok_or(AnnotationSelectionError::MissingSemanticLine)
-        });
+    let source_lines = selected_source_lines(block_lines, selection)?;
+    let mut source_lines = source_lines.into_iter();
     let first_source = source_lines
         .next()
-        .ok_or(AnnotationSelectionError::MissingSemanticLine)??;
+        .ok_or(AnnotationSelectionError::MissingSemanticLine)?;
     let (mut min_source, mut max_source) = (first_source, first_source);
     for source in source_lines {
-        let source = source?;
         min_source = min_source.min(source);
         max_source = max_source.max(source);
     }
@@ -344,6 +338,75 @@ pub fn build_annotation_anchor(
         selected_text_hash: blake3::hash(selected_text.as_bytes()).to_hex().to_string(),
         surrounding_text_hash: blake3::hash(surrounding.as_bytes()).to_hex().to_string(),
     })
+}
+
+fn selected_source_lines(
+    block_lines: &[BlockLine],
+    selection: &ActiveTextDrag,
+) -> Result<Vec<usize>, AnnotationSelectionError> {
+    let anchor = (
+        selection.anchor.block_line_idx,
+        selection.anchor.col_within_range,
+    );
+    let head = (
+        selection.head.block_line_idx,
+        selection.head.col_within_range,
+    );
+    let ((start_line, start_col), (end_line, end_col)) = if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+
+    let mut result = Vec::new();
+    for (line_idx, line) in block_lines
+        .iter()
+        .enumerate()
+        .take(end_line + 1)
+        .skip(start_line)
+        .filter(|(_, line)| line.selection_range == Some(selection.anchor.range_id))
+    {
+        // Table-shaped selections are not a linear column sweep. Their rows
+        // already carry an unambiguous scalar source line, so retain that
+        // established path.
+        if selection.kind != SelectionKind::Linear || line.source_spans.is_empty() {
+            result.push(
+                line.source_line
+                    .ok_or(AnnotationSelectionError::MissingSemanticLine)?,
+            );
+            continue;
+        }
+
+        let selectable_width = block_line_selectable_width(line);
+        let selected = if start_line == end_line {
+            start_col.min(end_col)..start_col.max(end_col).saturating_add(1)
+        } else if line_idx == start_line {
+            start_col..selectable_width
+        } else if line_idx == end_line {
+            0..end_col.saturating_add(1)
+        } else {
+            0..selectable_width
+        };
+        let selected = selected.start.min(selectable_width)..selected.end.min(selectable_width);
+        let selectable_start = selectable_cols(&line.content, &line.selectable)
+            .ok_or(AnnotationSelectionError::MissingSemanticLine)?
+            .start as usize;
+        let absolute = (selectable_start + selected.start as usize)
+            ..(selectable_start + selected.end as usize);
+        let before = result.len();
+        result.extend(
+            line.source_spans
+                .iter()
+                .filter(|span| {
+                    span.column_range.start < absolute.end && span.column_range.end > absolute.start
+                })
+                .map(|span| span.source_line),
+        );
+        if result.len() == before {
+            return Err(AnnotationSelectionError::MissingSemanticLine);
+        }
+    }
+    Ok(result)
 }
 
 fn surrounding_text(raw_text: &str, start_line: usize, end_line: usize) -> Option<String> {
@@ -397,8 +460,10 @@ mod tests {
     use crate::appearance::AppearanceConfig;
     use crate::scrollback::block::BlockContent;
     use crate::scrollback::blocks::UserPromptBlock;
+    use crate::scrollback::blocks::markdown_content::MarkdownContent;
     use crate::scrollback::text_selection::{RangeHit, SelectionKind};
-    use crate::scrollback::types::{BlockContext, DisplayMode};
+    use crate::scrollback::types::{BlockContext, DisplayMode, derive_selection_text};
+    use unicode_width::UnicodeWidthStr;
 
     fn context(width: u16) -> BlockContext {
         BlockContext {
@@ -430,6 +495,36 @@ mod tests {
             kind: SelectionKind::Linear,
             anchor_content_width: Some(12),
         }
+    }
+
+    fn selection_for_text(lines: &[BlockLine], needle: &str) -> ActiveTextDrag {
+        for (line_idx, line) in lines.iter().enumerate() {
+            let text = derive_selection_text(line);
+            let Some(byte_start) = text.find(needle) else {
+                continue;
+            };
+            let start_col = UnicodeWidthStr::width(&text[..byte_start]) as u16;
+            let end_col = start_col
+                .saturating_add(UnicodeWidthStr::width(needle) as u16)
+                .saturating_sub(1);
+            return ActiveTextDrag {
+                anchor: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: line_idx,
+                    col_within_range: start_col,
+                },
+                head: RangeHit {
+                    entry_idx: 0,
+                    range_id: 0,
+                    block_line_idx: line_idx,
+                    col_within_range: end_col,
+                },
+                kind: SelectionKind::Linear,
+                anchor_content_width: Some(80),
+            };
+        }
+        panic!("no rendered line contains {needle:?}");
     }
 
     #[test]
@@ -523,6 +618,57 @@ mod tests {
         assert_eq!(anchor.selected_text, "one source line");
         assert_eq!(anchor.selected_text_hash.len(), 64);
         assert_eq!(anchor.surrounding_text_hash.len(), 64);
+    }
+
+    #[test]
+    fn collapsed_soft_break_anchors_each_selected_side_at_multiple_widths() {
+        for (raw, first, second, widths) in [
+            ("**alpha**\n_beta_", "alpha", "beta", [80usize, 6]),
+            ("**甲乙**\n_丙丁_", "甲乙", "丙丁", [80usize, 5]),
+        ] {
+            let transcript = TranscriptEntry {
+                key: TranscriptKey {
+                    prompt_index: 2,
+                    role: AnnotationEntryRole::Assistant,
+                    ordinal: 0,
+                },
+                role: AnnotationEntryRole::Assistant,
+                target_prompt_index: 2,
+                raw_text: raw.to_string(),
+            };
+            for width in widths {
+                let output = MarkdownContent::new(raw).output(width);
+                let first_anchor = build_annotation_anchor(
+                    "parent",
+                    &transcript,
+                    &output.lines,
+                    &selection_for_text(&output.lines, first),
+                    first,
+                )
+                .unwrap();
+                let second_anchor = build_annotation_anchor(
+                    "parent",
+                    &transcript,
+                    &output.lines,
+                    &selection_for_text(&output.lines, second),
+                    second,
+                )
+                .unwrap();
+                assert_eq!(
+                    (first_anchor.start_source_line, first_anchor.end_source_line),
+                    (1, 1),
+                    "raw={raw:?}, width={width}, first={first:?}",
+                );
+                assert_eq!(
+                    (
+                        second_anchor.start_source_line,
+                        second_anchor.end_source_line
+                    ),
+                    (2, 2),
+                    "raw={raw:?}, width={width}, second={second:?}",
+                );
+            }
+        }
     }
 
     #[test]

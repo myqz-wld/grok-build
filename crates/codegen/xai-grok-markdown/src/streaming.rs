@@ -311,6 +311,9 @@ impl StreamingMarkdownRenderer {
         // Truncate output to frozen state (discard stale tail)
         self.output.lines.truncate(self.frozen.lines_len);
         self.output.line_source_map.truncate(self.frozen.lines_len);
+        self.output
+            .line_source_spans
+            .truncate(self.frozen.lines_len);
         // Discard stale tail hyperlinks (keep frozen ones)
         self.output
             .hyperlinks
@@ -362,6 +365,9 @@ impl StreamingMarkdownRenderer {
         self.output
             .line_source_map
             .extend(tail_output.line_source_map);
+        self.output
+            .line_source_spans
+            .extend(tail_output.line_source_spans);
 
         // Offset tail hyperlink line indices by frozen line count and append
         let frozen_lines = self.frozen.lines_len;

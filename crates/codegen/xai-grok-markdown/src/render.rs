@@ -16,10 +16,44 @@ use crate::buffers::{MarkdownBuffers, RenderEvent, RenderEventKind, unicode_disp
 use crate::checkpoint::Checkpoint;
 use crate::colors::adapt_style;
 use crate::hyperlinks::{ChunkLinkRange, chunk_link_offsets, emit_segment_hyperlinks};
-use crate::output::{HyperlinkTarget, MarkdownRenderOutput};
+use crate::output::{HyperlinkTarget, MarkdownRenderOutput, SourceLineSpan};
 use crate::parse::ParsedMarkdown;
 use crate::source_map::SourceMap;
 use crate::style::{all_hidden, merge_styles};
+
+fn record_source_line_span(
+    spans: &mut Vec<SourceLineSpan>,
+    start_col: usize,
+    width: usize,
+    source_line: usize,
+) {
+    if width == 0 {
+        return;
+    }
+    let end_col = start_col + width;
+    if let Some(last) = spans.last_mut()
+        && last.source_line == source_line
+        && last.column_range.end == start_col
+    {
+        last.column_range.end = end_col;
+        return;
+    }
+    spans.push(SourceLineSpan {
+        column_range: start_col..end_col,
+        source_line,
+    });
+}
+
+fn full_line_source_spans(line: &Line<'_>, source_line: usize) -> Vec<SourceLineSpan> {
+    let width = line.width();
+    (width > 0)
+        .then(|| SourceLineSpan {
+            column_range: 0..width,
+            source_line,
+        })
+        .into_iter()
+        .collect()
+}
 
 /// Trait for converting anstyle to ratatui style.
 trait StyleInto<T> {
@@ -524,6 +558,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut line_source_map: Vec<usize> = Vec::new();
+        let mut line_source_spans: Vec<Vec<SourceLineSpan>> = Vec::new();
         let mut hyperlinks: Vec<HyperlinkTarget> = Vec::new();
 
         let mut last_pos = 0;
@@ -535,6 +570,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
         let mut next_link_idx: usize = 0;
         // Running display-column tracker for the in-progress line.
         let mut cur_col_in_line: usize = 0;
+        let mut current_source_spans: Vec<SourceLineSpan> = Vec::new();
 
         let checkpoint_info = self.last_checkpoint;
         let mut checkpoint_output_lines: Option<usize> = None;
@@ -620,6 +656,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                             line_source_map.push(current_source_line);
                             let line = Line::from(std::mem::take(&mut self.buffers.current_spans));
                             lines.push(line);
+                            line_source_spans.push(std::mem::take(&mut current_source_spans));
                             cur_col_in_line = 0;
                         }
                         checkpoint_output_lines = Some(lines.len());
@@ -665,6 +702,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                                 {
                                     line_source_map.push(current_source_line);
                                     lines.push(Line::default());
+                                    line_source_spans.push(Vec::new());
                                     cur_col_in_line = 0;
                                 }
                                 in_hidden_code_block = !in_hidden_code_block;
@@ -737,6 +775,8 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                                     } else {
                                         line
                                     });
+                                    line_source_spans
+                                        .push(std::mem::take(&mut current_source_spans));
                                     if byte_offset > last_line_count_pos {
                                         current_source_line += count_newlines_in_range(
                                             last_line_count_pos,
@@ -761,10 +801,17 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                                 }
 
                                 if !segment.is_empty() {
+                                    let width = unicode_display_width(segment);
+                                    record_source_line_span(
+                                        &mut current_source_spans,
+                                        cur_col_in_line,
+                                        width,
+                                        current_source_line,
+                                    );
                                     self.buffers
                                         .current_spans
                                         .push(Span::styled(segment.to_string(), ratatui_style));
-                                    cur_col_in_line += unicode_display_width(segment);
+                                    cur_col_in_line += width;
                                 }
                                 byte_offset += segment.len() + 1;
                                 seg_x_offset += segment.len() + 1;
@@ -813,14 +860,23 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                                         ))
                                         .style(code_bg_style);
                                         lines.push(line);
+                                        line_source_spans
+                                            .push(std::mem::take(&mut current_source_spans));
                                         current_source_line += 1;
                                         cur_col_in_line = 0;
                                     }
                                     if !segment.is_empty() {
+                                        let width = unicode_display_width(segment);
+                                        record_source_line_span(
+                                            &mut current_source_spans,
+                                            cur_col_in_line,
+                                            width,
+                                            current_source_line,
+                                        );
                                         self.buffers
                                             .current_spans
                                             .push(Span::styled(segment.to_string(), ratatui_style));
-                                        cur_col_in_line += unicode_display_width(segment);
+                                        cur_col_in_line += width;
                                     }
                                 }
                             }
@@ -831,6 +887,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                                     Line::from(std::mem::take(&mut self.buffers.current_spans))
                                         .style(code_bg_style);
                                 lines.push(line);
+                                line_source_spans.push(std::mem::take(&mut current_source_spans));
                                 cur_col_in_line = 0;
                             }
                         }
@@ -865,6 +922,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                         if !self.buffers.current_spans.is_empty() {
                             line_source_map.push(current_source_line);
                             lines.push(Line::from(std::mem::take(&mut self.buffers.current_spans)));
+                            line_source_spans.push(std::mem::take(&mut current_source_spans));
                             // cur_col_in_line is reset unconditionally after
                             // the block lines are emitted below.
                         }
@@ -889,6 +947,8 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                             current_source_line = table_start_source_line + offset;
                             line_source_map.push(current_source_line);
                             lines.push(styled_line.clone());
+                            line_source_spans
+                                .push(full_line_source_spans(styled_line, current_source_line));
                         }
                         // Translate table-local hyperlink coordinates into
                         // absolute line indices and append to the global list.
@@ -937,6 +997,8 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                         for styled_line in &mrepl.styled_lines {
                             line_source_map.push(start_source_line);
                             lines.push(styled_line.clone());
+                            line_source_spans
+                                .push(full_line_source_spans(styled_line, start_source_line));
                         }
                         cur_col_in_line = 0;
 
@@ -1025,6 +1087,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                         } else {
                             line
                         });
+                        line_source_spans.push(std::mem::take(&mut current_source_spans));
                         if byte_offset > last_line_count_pos {
                             current_source_line += count_newlines_in_range(
                                 last_line_count_pos,
@@ -1049,10 +1112,17 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
                     }
 
                     if !segment.is_empty() {
+                        let width = unicode_display_width(segment);
+                        record_source_line_span(
+                            &mut current_source_spans,
+                            cur_col_in_line,
+                            width,
+                            current_source_line,
+                        );
                         self.buffers
                             .current_spans
                             .push(Span::raw(segment.to_string()));
-                        cur_col_in_line += unicode_display_width(segment);
+                        cur_col_in_line += width;
                     }
                     byte_offset += segment.len() + 1;
                     seg_x_offset += segment.len() + 1;
@@ -1072,6 +1142,7 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
             } else {
                 line
             });
+            line_source_spans.push(std::mem::take(&mut current_source_spans));
         }
 
         // If checkpoint wasn't captured during event processing, compute it based on
@@ -1136,11 +1207,14 @@ impl<'a, 'b> ParsedMarkdown<'a, 'b> {
             &line_source_map,
             std::mem::take(&mut self.buffers.code_blocks),
         );
+        debug_assert_eq!(lines.len(), line_source_map.len());
+        debug_assert_eq!(lines.len(), line_source_spans.len());
 
         (
             MarkdownRenderOutput {
                 lines,
                 line_source_map,
+                line_source_spans,
                 hyperlinks,
                 code_blocks,
             },
@@ -2095,11 +2169,20 @@ mod tests {
         let (output, _) = render_markdown_ratatui_full(md, test_style::STYLE, false, None);
         assert_eq!(output.lines.len(), 1);
         assert_eq!(output.line_source_map.len(), 1);
+        assert_eq!(output.line_source_spans.len(), 1);
         assert!(
             output.line_source_map[0] <= 1,
             "got {}",
             output.line_source_map[0]
         );
+        let source_at = |column: usize| {
+            output.line_source_spans[0]
+                .iter()
+                .find(|span| span.column_range.contains(&column))
+                .map(|span| span.source_line)
+        };
+        assert_eq!(source_at(0), Some(0));
+        assert_eq!(source_at("Foo bar ".len()), Some(1));
     }
 
     #[test]

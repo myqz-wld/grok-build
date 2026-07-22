@@ -55,8 +55,8 @@ use permissions::{apply_recap_block, handle_permission_request, should_drop_late
 
 // Hub + child modules (via `use super::*`) need sibling symbols in this scope.
 use routing::{
-    SessionMatch, find_session_match, interaction_target_agent, is_matched_agent_active,
-    mcp_target_agent, resolve_notif_agent, resolve_target_view,
+    SessionMatch, find_session_match, find_session_match_for_prompt, interaction_target_agent,
+    is_matched_agent_active, mcp_target_agent, resolve_notif_agent, resolve_target_view,
 };
 
 use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
@@ -142,7 +142,11 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
             // Wait-state bookkeeping after the agent borrow ends (parked marker).
             let mut wait_state_agent: Option<AgentId> = None;
 
-            let affected = match find_session_match(app, &notif.request.session_id) {
+            let affected = match find_session_match_for_prompt(
+                app,
+                &notif.request.session_id,
+                meta.prompt_id.as_deref(),
+            ) {
                 Some(SessionMatch::Root(id)) => {
                     let is_active = is_matched_agent_active(app, id);
                     wait_state_agent = Some(id);

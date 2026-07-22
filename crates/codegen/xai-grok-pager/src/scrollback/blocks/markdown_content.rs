@@ -11,8 +11,9 @@ use std::cell::RefCell;
 
 use ratatui::text::Line;
 
-use crate::render::wrapping::word_wrap_lines_with_joiners;
+use crate::render::wrapping::{word_wrap_lines_with_joiners, wrap_byte_ranges_matching};
 use crate::scrollback::types::{BlockLine, BlockOutput};
+use unicode_width::UnicodeWidthStr;
 
 use super::quote_bar::QuoteBarStrip;
 
@@ -37,6 +38,9 @@ struct RenderState {
     cache_joiners: Vec<Option<String>>,
     /// 0-based raw Markdown source line for each post-wrap cached row.
     cache_source_lines: Vec<usize>,
+    /// Display-column source spans for each post-wrap cached row. Source lines
+    /// remain 0-based until `BlockLine` conversion.
+    cache_source_spans: Vec<Vec<xai_grok_markdown::SourceLineSpan>>,
     /// Number of pre-wrap (renderer output) lines that were frozen at the time
     /// we last wrapped. Lines `0..frozen_pre_wrap_count` are stable and their
     /// wrapped output is cached in `cache_lines[0..frozen_wrapped_count]`.
@@ -70,6 +74,8 @@ pub struct WrappedLines<'a> {
     pub joiners: &'a [Option<String>],
     /// 0-based raw Markdown source line, parallel to `lines`.
     pub source_lines: &'a [usize],
+    /// Display-column source identity, parallel to `lines`.
+    pub source_spans: &'a [Vec<xai_grok_markdown::SourceLineSpan>],
 }
 
 /// Wrap pre-rendered Markdown rows while duplicating each row's source-line
@@ -77,25 +83,100 @@ pub struct WrappedLines<'a> {
 fn wrap_lines_with_sources(
     lines: Vec<Line<'static>>,
     source_lines: Vec<usize>,
+    source_spans: Vec<Vec<xai_grok_markdown::SourceLineSpan>>,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<String>>, Vec<usize>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<Option<String>>,
+    Vec<usize>,
+    Vec<Vec<xai_grok_markdown::SourceLineSpan>>,
+) {
     debug_assert_eq!(lines.len(), source_lines.len());
+    debug_assert_eq!(lines.len(), source_spans.len());
     let mut wrapped_lines = Vec::new();
     let mut wrapped_joiners = Vec::new();
     let mut wrapped_sources = Vec::new();
+    let mut wrapped_source_spans = Vec::new();
 
     for (idx, line) in lines.into_iter().enumerate() {
         // The renderer guarantees a parallel map. Keep a deterministic
         // fallback in release builds so malformed future renderer output does
         // not drop visible text.
         let source_line = source_lines.get(idx).copied().unwrap_or(idx);
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let wrap_ranges = wrap_byte_ranges_matching(&flat, width);
         let (fragments, joiners) = word_wrap_lines_with_joiners(std::iter::once(line), width);
+        let detailed_spans = source_spans.get(idx).map(Vec::as_slice).unwrap_or_default();
+        if wrap_ranges.len() == fragments.len() {
+            // Both inputs are ordered. Advance through the source text and
+            // semantic spans monotonically so a long rendered paragraph is
+            // linear in its bytes, spans, and emitted intersections instead
+            // of rescanning both prefixes for every wrapped fragment.
+            let mut byte_cursor = 0usize;
+            let mut display_col = 0usize;
+            let mut source_span_cursor = 0usize;
+            for (fragment, range) in fragments.iter().zip(&wrap_ranges) {
+                debug_assert!(range.start >= byte_cursor);
+                display_col += UnicodeWidthStr::width(&flat[byte_cursor..range.start]);
+                let start_col = display_col;
+                display_col += UnicodeWidthStr::width(&flat[range.clone()]);
+                let end_col = display_col;
+                byte_cursor = range.end;
+                let range_width = end_col.saturating_sub(start_col);
+                let output_prefix = fragment.width().saturating_sub(range_width);
+                let mut spans = Vec::new();
+
+                while detailed_spans
+                    .get(source_span_cursor)
+                    .is_some_and(|span| span.column_range.end <= start_col)
+                {
+                    source_span_cursor += 1;
+                }
+                let mut scan = source_span_cursor;
+                while let Some(span) = detailed_spans.get(scan) {
+                    if span.column_range.start >= end_col {
+                        break;
+                    }
+                    let start = span.column_range.start.max(start_col);
+                    let end = span.column_range.end.min(end_col);
+                    if start < end {
+                        spans.push(xai_grok_markdown::SourceLineSpan {
+                            column_range: (output_prefix + start - start_col)
+                                ..(output_prefix + end - start_col),
+                            source_line: span.source_line,
+                        });
+                    }
+                    scan += 1;
+                }
+                while detailed_spans
+                    .get(source_span_cursor)
+                    .is_some_and(|span| span.column_range.end <= end_col)
+                {
+                    source_span_cursor += 1;
+                }
+                wrapped_source_spans.push(spans);
+            }
+        } else {
+            // Table fitting and future specialized wrappers may not share the
+            // ordinary textwrap ranges. Preserve display and use the existing
+            // scalar source-line fallback rather than inventing coordinates.
+            wrapped_source_spans.extend(std::iter::repeat_n(Vec::new(), fragments.len()));
+        }
         wrapped_sources.extend(std::iter::repeat_n(source_line, fragments.len()));
         wrapped_lines.extend(fragments);
         wrapped_joiners.extend(joiners);
     }
 
-    (wrapped_lines, wrapped_joiners, wrapped_sources)
+    (
+        wrapped_lines,
+        wrapped_joiners,
+        wrapped_sources,
+        wrapped_source_spans,
+    )
 }
 
 /// Expand tab characters to spaces using the current global tab_width.
@@ -158,6 +239,7 @@ impl MarkdownContent {
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
                 cache_source_lines: Vec::new(),
+                cache_source_spans: Vec::new(),
                 frozen_pre_wrap_count: 0,
                 frozen_wrapped_count: 0,
             }),
@@ -177,6 +259,7 @@ impl MarkdownContent {
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
                 cache_source_lines: Vec::new(),
+                cache_source_spans: Vec::new(),
                 frozen_pre_wrap_count: 0,
                 frozen_wrapped_count: 0,
             }),
@@ -318,12 +401,14 @@ impl MarkdownContent {
         if state.cache_lines.is_empty()
             && state.cache_joiners.is_empty()
             && state.cache_source_lines.is_empty()
+            && state.cache_source_spans.is_empty()
         {
             return;
         }
         state.cache_lines = Vec::new();
         state.cache_joiners = Vec::new();
         state.cache_source_lines = Vec::new();
+        state.cache_source_spans = Vec::new();
         state.cache_generation = u64::MAX; // force rebuild on next use
         state.frozen_pre_wrap_count = 0;
         state.frozen_wrapped_count = 0;
@@ -400,7 +485,14 @@ impl MarkdownContent {
             let new_frozen = view.lines[state.frozen_pre_wrap_count..frozen_count].to_vec();
             let new_sources =
                 view.line_source_map[state.frozen_pre_wrap_count..frozen_count].to_vec();
-            Some(wrap_lines_with_sources(new_frozen, new_sources, width))
+            let new_source_spans =
+                view.line_source_spans[state.frozen_pre_wrap_count..frozen_count].to_vec();
+            Some(wrap_lines_with_sources(
+                new_frozen,
+                new_sources,
+                new_source_spans,
+                width,
+            ))
         } else {
             None
         };
@@ -411,7 +503,13 @@ impl MarkdownContent {
             let view = state.renderer.view();
             let tail = view.lines[frozen_count..].to_vec();
             let tail_sources = view.line_source_map[frozen_count..].to_vec();
-            Some(wrap_lines_with_sources(tail, tail_sources, width))
+            let tail_source_spans = view.line_source_spans[frozen_count..].to_vec();
+            Some(wrap_lines_with_sources(
+                tail,
+                tail_sources,
+                tail_source_spans,
+                width,
+            ))
         } else {
             None
         };
@@ -422,21 +520,24 @@ impl MarkdownContent {
         state.cache_lines.truncate(frozen_wc);
         state.cache_joiners.truncate(frozen_wc);
         state.cache_source_lines.truncate(frozen_wc);
+        state.cache_source_spans.truncate(frozen_wc);
 
         // Append newly frozen wrapped lines
-        if let Some((new_lines, new_joiners, new_sources)) = new_frozen_wrapped {
+        if let Some((new_lines, new_joiners, new_sources, new_source_spans)) = new_frozen_wrapped {
             state.cache_lines.extend(new_lines);
             state.cache_joiners.extend(new_joiners);
             state.cache_source_lines.extend(new_sources);
+            state.cache_source_spans.extend(new_source_spans);
             state.frozen_pre_wrap_count = frozen_count;
             state.frozen_wrapped_count = state.cache_lines.len();
         }
 
         // Append tail wrapped lines
-        if let Some((tail_lines, tail_joiners, tail_sources)) = tail_wrapped {
+        if let Some((tail_lines, tail_joiners, tail_sources, tail_source_spans)) = tail_wrapped {
             state.cache_lines.extend(tail_lines);
             state.cache_joiners.extend(tail_joiners);
             state.cache_source_lines.extend(tail_sources);
+            state.cache_source_spans.extend(tail_source_spans);
         }
 
         state.cache_width = width;
@@ -455,6 +556,7 @@ impl MarkdownContent {
             lines: &state.cache_lines,
             joiners: &state.cache_joiners,
             source_lines: &state.cache_source_lines,
+            source_spans: &state.cache_source_spans,
         })
     }
 
@@ -478,13 +580,23 @@ impl MarkdownContent {
                         .iter()
                         .zip(wrapped.joiners.iter())
                         .zip(wrapped.source_lines.iter())
-                        .map(|((line, joiner), source_line)| {
+                        .zip(wrapped.source_spans.iter())
+                        .map(|(((line, joiner), source_line), source_spans)| {
                             let mut content = line.clone();
                             let selectable = strip.selectable(&mut content);
+                            let source_spans = source_spans
+                                .iter()
+                                .cloned()
+                                .map(|mut span| {
+                                    span.source_line += 1;
+                                    span
+                                })
+                                .collect();
                             let mut block_line = BlockLine::styled(content)
                                 .with_selection_range(Some(MARKDOWN_BODY_RANGE))
                                 .with_joiner(joiner.clone())
-                                .with_source_line(Some(source_line + 1));
+                                .with_source_line(Some(source_line + 1))
+                                .with_source_spans(source_spans);
                             block_line.selectable = selectable;
                             if let Some(bg) = line.style.bg {
                                 block_line.with_background(bg)
@@ -682,6 +794,29 @@ mod tests {
         );
         assert_output_matches_renderer_source_map(&md, 80);
         assert_output_matches_renderer_source_map(&md, 10);
+    }
+
+    #[test]
+    fn many_collapsed_soft_break_spans_wrap_without_rescanning_prefixes() {
+        // Pretty Markdown renders this as one long row with thousands of
+        // source spans. At width 1 every raw line becomes its own fragment,
+        // exercising the monotonic byte/span cursors in
+        // `wrap_lines_with_sources` at a scale that made the former nested
+        // prefix/span scans quadratic.
+        const SOURCE_LINES: usize = 4_096;
+        let raw = std::iter::repeat_n("x", SOURCE_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = MarkdownContent::new(raw).output(1);
+        let observed = output
+            .lines
+            .iter()
+            .flat_map(|line| line.source_spans.iter().map(|span| span.source_line))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(observed.len(), SOURCE_LINES);
+        assert_eq!(observed.first().copied(), Some(1));
+        assert_eq!(observed.last().copied(), Some(SOURCE_LINES));
     }
 
     #[test]

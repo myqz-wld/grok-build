@@ -9,9 +9,10 @@ use unicode_width::UnicodeWidthStr;
 
 use super::AgentView;
 use crate::annotations::{
-    AnnotationAnchor, AnnotationEntryRole, AnnotationExchangeStatus, AnnotationOrphanReason,
-    AnnotationThread, AnnotationThreadAttachment, PendingAnnotationFork, ThreadId,
-    resolve_transcript_entry, resolve_transcript_key_with_index, validate_annotation_anchor,
+    AnnotationAnchor, AnnotationEntryRole, AnnotationExchangePhase, AnnotationExchangeStatus,
+    AnnotationOrphanReason, AnnotationThread, AnnotationThreadAttachment, PendingAnnotationFork,
+    ThreadId, resolve_transcript_entry, resolve_transcript_key_with_index,
+    validate_annotation_anchor,
 };
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
@@ -20,8 +21,9 @@ use crate::scrollback::{
 };
 use crate::theme::Theme;
 use crate::views::annotation::{
-    AnnotationCardAction, AnnotationComposerState, AnnotationComposerTarget,
-    AnnotationContextMenuState, COMPOSER_CANCEL_ID, COMPOSER_SUBMIT_ID,
+    AnnotationCardAction, AnnotationCardBodyCache, AnnotationCardBodyCacheKey,
+    AnnotationComposerState, AnnotationComposerTarget, AnnotationContextMenuState,
+    COMPOSER_CANCEL_ID, COMPOSER_SUBMIT_ID,
 };
 use crate::views::modal_window::{ModalWindowOutcome, handle_modal_mouse};
 use crate::views::prompt_widget::{EnterOutcome, PromptEvent};
@@ -56,6 +58,10 @@ impl AgentView {
     }
 
     fn open_annotation_follow_up(&mut self, thread_id: ThreadId) -> InputOutcome {
+        if let Some(message) = self.annotation_storage_unavailable() {
+            self.show_toast(&message);
+            return InputOutcome::Changed;
+        }
         let Some(thread) = self.annotation_runtime.state.threads.get(&thread_id) else {
             self.show_toast("Annotation thread not found");
             return InputOutcome::Changed;
@@ -332,6 +338,10 @@ impl AgentView {
                 InputOutcome::Changed
             }
             AnnotationCardAction::Retry => {
+                if let Some(message) = self.annotation_runtime.last_error.as_ref() {
+                    self.show_toast(&format!("Annotation storage is unavailable: {message}"));
+                    return InputOutcome::Changed;
+                }
                 let Some(PendingAnnotationFork::Failed {
                     anchor, question, ..
                 }) = self.annotation_runtime.pending_forks.remove(&thread_id)
@@ -401,6 +411,7 @@ impl AgentView {
 
         let fallback_entry = self.orphan_annotation_fallback_entry();
         let theme = Theme::current();
+        let theme_revision = annotation_theme_revision(&theme);
         let hovered = self.annotation_ui.hovered_card_button.as_ref();
         let mut decorations = Vec::new();
 
@@ -431,9 +442,43 @@ impl AgentView {
                 fallback_entry
             };
             let Some(entry_id) = entry_id else { continue };
-            let expanded = self.annotation_ui.expanded_threads.contains(thread_id)
-                || self.annotation_runtime.in_flight.contains_key(thread_id);
-            decorations.push(build_thread_card(
+            let in_flight = self.annotation_runtime.in_flight.get(thread_id);
+            let expanded =
+                self.annotation_ui.expanded_threads.contains(thread_id) || in_flight.is_some();
+            let active = in_flight.is_some_and(|in_flight| {
+                !matches!(
+                    in_flight.phase,
+                    AnnotationExchangePhase::DrainingAfterStorageFailure
+                )
+            });
+            let content_revision = self.annotation_runtime.thread_revision(*thread_id);
+            let cache_key = AnnotationCardBodyCacheKey {
+                content_revision,
+                width: content_width,
+                theme_revision,
+                expanded,
+            };
+            let body = if let Some(cache) = self
+                .annotation_ui
+                .thread_card_bodies
+                .get(thread_id)
+                .filter(|cache| cache.key == cache_key)
+            {
+                cache.lines.clone()
+            } else {
+                let lines = build_thread_card_body(thread, content_width, expanded, &theme);
+                self.annotation_ui.thread_card_bodies.insert(
+                    *thread_id,
+                    AnnotationCardBodyCache {
+                        key: cache_key,
+                        lines: lines.clone(),
+                    },
+                );
+                self.annotation_ui.card_body_cache_misses =
+                    self.annotation_ui.card_body_cache_misses.saturating_add(1);
+                lines
+            };
+            decorations.push(build_thread_card_with_body(
                 thread,
                 entry_id,
                 if attached {
@@ -443,11 +488,23 @@ impl AgentView {
                 },
                 content_width,
                 expanded,
-                self.annotation_runtime.in_flight.contains_key(thread_id),
+                active,
                 hovered,
+                body,
+                content_revision,
+                theme_revision,
                 &theme,
             ));
         }
+        self.annotation_ui
+            .thread_card_bodies
+            .retain(|thread_id, _| {
+                self.annotation_runtime
+                    .state
+                    .threads
+                    .get(thread_id)
+                    .is_some_and(|thread| !thread.deleted)
+            });
         self.scrollback.set_decorations(decorations);
     }
 
@@ -497,7 +554,10 @@ impl AgentView {
             .collect();
         for (thread_id, attachment) in updates {
             if let Some(thread) = self.annotation_runtime.state.threads.get_mut(&thread_id) {
-                thread.attachment = attachment;
+                if thread.attachment != attachment {
+                    thread.attachment = attachment;
+                    self.annotation_runtime.bump_thread_revision(thread_id);
+                }
             }
         }
     }
@@ -572,6 +632,7 @@ fn build_pending_card(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_thread_card(
     thread: &AnnotationThread,
@@ -583,7 +644,82 @@ fn build_thread_card(
     hovered: Option<&(String, String)>,
     theme: &Theme,
 ) -> ScrollbackDecoration {
+    let body = build_thread_card_body(thread, width, expanded, theme);
+    build_thread_card_with_body(
+        thread,
+        entry_id,
+        after_source_line,
+        width,
+        expanded,
+        active,
+        hovered,
+        body,
+        0,
+        annotation_theme_revision(theme),
+        theme,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_thread_card_with_body(
+    thread: &AnnotationThread,
+    entry_id: EntryId,
+    after_source_line: usize,
+    width: u16,
+    expanded: bool,
+    active: bool,
+    hovered: Option<&(String, String)>,
+    body: Vec<Line<'static>>,
+    content_revision: u64,
+    theme_revision: u64,
+    theme: &Theme,
+) -> ScrollbackDecoration {
     let status = thread_status(thread, active);
+    let mut actions = vec![AnnotationCardAction::Toggle];
+    if active {
+        actions.push(AnnotationCardAction::Cancel);
+    } else {
+        if matches!(thread.attachment, AnnotationThreadAttachment::Attached) {
+            actions.push(AnnotationCardAction::FollowUp);
+            actions.push(AnnotationCardAction::OpenChild);
+        } else if !matches!(
+            thread.attachment,
+            AnnotationThreadAttachment::Orphaned(AnnotationOrphanReason::MissingChildSession)
+        ) {
+            actions.push(AnnotationCardAction::OpenChild);
+        }
+        actions.push(AnnotationCardAction::Delete);
+    }
+    let id = thread.thread_id.to_string();
+    let action_rows = card_action_rows(&id, &actions, width, expanded, hovered, theme);
+    build_card(
+        id,
+        &thread.anchor,
+        entry_id,
+        after_source_line,
+        status,
+        body,
+        action_rows,
+        width,
+        revision_for_thread(
+            thread.thread_id,
+            content_revision,
+            theme_revision,
+            width,
+            expanded,
+            active,
+            hovered,
+        ),
+        theme,
+    )
+}
+
+fn build_thread_card_body(
+    thread: &AnnotationThread,
+    width: u16,
+    expanded: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut body = Vec::new();
     if expanded {
         for exchange in &thread.exchanges {
@@ -655,35 +791,7 @@ fn build_thread_card(
         ));
     }
 
-    let mut actions = vec![AnnotationCardAction::Toggle];
-    if active {
-        actions.push(AnnotationCardAction::Cancel);
-    } else {
-        if matches!(thread.attachment, AnnotationThreadAttachment::Attached) {
-            actions.push(AnnotationCardAction::FollowUp);
-            actions.push(AnnotationCardAction::OpenChild);
-        } else if !matches!(
-            thread.attachment,
-            AnnotationThreadAttachment::Orphaned(AnnotationOrphanReason::MissingChildSession)
-        ) {
-            actions.push(AnnotationCardAction::OpenChild);
-        }
-        actions.push(AnnotationCardAction::Delete);
-    }
-    let id = thread.thread_id.to_string();
-    let action_rows = card_action_rows(&id, &actions, width, expanded, hovered, theme);
-    build_card(
-        id,
-        &thread.anchor,
-        entry_id,
-        after_source_line,
-        status,
-        body,
-        action_rows,
-        width,
-        revision_for_thread(thread, width, expanded, active, hovered),
-        theme,
-    )
+    body
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -895,25 +1003,60 @@ fn revision_for_pending(
 }
 
 fn revision_for_thread(
-    thread: &AnnotationThread,
+    thread_id: ThreadId,
+    content_revision: u64,
+    theme_revision: u64,
     width: u16,
     expanded: bool,
     active: bool,
     hovered: Option<&(String, String)>,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    thread.thread_id.hash(&mut hasher);
+    thread_id.hash(&mut hasher);
+    content_revision.hash(&mut hasher);
+    theme_revision.hash(&mut hasher);
     width.hash(&mut hasher);
     expanded.hash(&mut hasher);
     active.hash(&mut hasher);
-    format!("{:?}", thread.attachment).hash(&mut hasher);
-    for exchange in &thread.exchanges {
-        exchange.exchange_id.hash(&mut hasher);
-        exchange.question.hash(&mut hasher);
-        exchange.answer_markdown.hash(&mut hasher);
-        format!("{:?}", exchange.status).hash(&mut hasher);
-    }
     hovered.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn annotation_theme_revision(theme: &Theme) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // The cached body uses these label/status colors plus the complete
+    // Markdown palette. Hashing fixed-size style values avoids walking any
+    // annotation text while still invalidating live theme changes.
+    macro_rules! hash_styles {
+        ($($value:expr),+ $(,)?) => {
+            $($value.hash(&mut hasher);)+
+        };
+    }
+    hash_styles!(
+        theme.accent_user,
+        theme.accent_error,
+        theme.gray,
+        theme.warning,
+        theme.md_heading_h1,
+        theme.md_heading_h1_mod,
+        theme.md_heading_h2,
+        theme.md_heading_h2_mod,
+        theme.md_heading_h3,
+        theme.md_heading_h3_mod,
+        theme.md_heading_h4,
+        theme.md_heading_h4_mod,
+        theme.md_heading_h5,
+        theme.md_heading_h5_mod,
+        theme.md_heading_h6,
+        theme.md_heading_h6_mod,
+        theme.md_code,
+        theme.md_task_checked,
+        theme.md_task_unchecked,
+        theme.md_muted,
+        theme.md_code_bg,
+        theme.md_text,
+        theme.link_fg,
+    );
     hasher.finish()
 }
 
@@ -922,7 +1065,7 @@ mod tests {
     use super::*;
     use crate::annotations::{AnnotationExchange, TranscriptKey};
     use crate::app::agent_view::test_agent_view;
-    use crate::scrollback::blocks::UserPromptBlock;
+    use crate::scrollback::blocks::{AgentMessageBlock, UserPromptBlock};
     use crate::scrollback::text_selection::{
         PersistentTextSelection, ResolvedSelectableLine, SelectionEndpoint, SelectionKind,
         SelectionOrigin, VisibleBlockGeometry,
@@ -972,6 +1115,37 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn agent_with_thread_card(mut thread: AnnotationThread) -> AgentView {
+        let selected = "selected text";
+        thread.anchor.start_source_line = 1;
+        thread.anchor.end_source_line = 1;
+        thread.anchor.selected_text = selected.into();
+        thread.anchor.selected_text_hash = blake3::hash(selected.as_bytes()).to_hex().to_string();
+        thread.anchor.surrounding_text_hash =
+            blake3::hash(selected.as_bytes()).to_hex().to_string();
+        thread.attachment = AnnotationThreadAttachment::Attached;
+        let thread_id = thread.thread_id;
+
+        let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
+        let mut user = UserPromptBlock::new("question");
+        user.prompt_index = Some(1);
+        agent.scrollback.push_block(RenderBlock::UserPrompt(user));
+        agent
+            .scrollback
+            .push_block(RenderBlock::AgentMessage(AgentMessageBlock::new(selected)));
+        agent
+            .annotation_runtime
+            .state
+            .threads
+            .insert(thread_id, thread);
+        agent
+            .annotation_runtime
+            .thread_revisions
+            .insert(thread_id, 1);
+        agent.annotation_ui.expanded_threads.insert(thread_id);
+        agent
     }
 
     fn agent_with_annotatable_selection() -> AgentView {
@@ -1060,6 +1234,60 @@ mod tests {
         assert!(actions.contains("open_child"));
         assert!(actions.contains("delete"));
         assert!(card.lines.len() > 5, "expanded card must include body rows");
+    }
+
+    #[test]
+    fn long_answer_card_cache_hits_on_idle_and_hover_redraws_and_invalidates_precisely() {
+        let mut thread = completed_thread();
+        thread.exchanges[0].answer_markdown =
+            "A paragraph with **formatting** and `code`.\n\n".repeat(2_000);
+        let thread_id = thread.thread_id;
+        let mut agent = agent_with_thread_card(thread);
+
+        agent.sync_annotation_decorations(80);
+        assert_eq!(agent.annotation_ui.card_body_cache_misses, 1);
+        assert_eq!(agent.annotation_ui.thread_card_bodies.len(), 1);
+
+        for redraw in 0..64 {
+            agent.annotation_ui.hovered_card_button =
+                (redraw % 2 == 0).then(|| (thread_id.to_string(), "toggle".into()));
+            agent.sync_annotation_decorations(80);
+        }
+        assert_eq!(
+            agent.annotation_ui.card_body_cache_misses, 1,
+            "hover-only and idle redraws must not reparse a long Markdown answer"
+        );
+
+        agent.sync_annotation_decorations(72);
+        assert_eq!(agent.annotation_ui.card_body_cache_misses, 2);
+
+        agent.annotation_ui.expanded_threads.remove(&thread_id);
+        agent.sync_annotation_decorations(72);
+        assert_eq!(agent.annotation_ui.card_body_cache_misses, 3);
+
+        agent.annotation_ui.expanded_threads.insert(thread_id);
+        agent
+            .annotation_runtime
+            .state
+            .threads
+            .get_mut(&thread_id)
+            .unwrap()
+            .exchanges[0]
+            .answer_markdown
+            .push_str("\nnew streamed content");
+        agent.annotation_runtime.bump_thread_revision(thread_id);
+        agent.sync_annotation_decorations(72);
+        assert_eq!(agent.annotation_ui.card_body_cache_misses, 4);
+        assert_eq!(
+            agent.annotation_ui.thread_card_bodies.len(),
+            1,
+            "one-entry-per-thread replacement keeps the cache bounded"
+        );
+        assert_ne!(
+            annotation_theme_revision(&Theme::groknight()),
+            annotation_theme_revision(&Theme::grokday()),
+            "theme changes must invalidate cached styled Markdown"
+        );
     }
 
     #[test]

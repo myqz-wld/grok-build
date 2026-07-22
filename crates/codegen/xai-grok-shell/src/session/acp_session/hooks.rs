@@ -153,7 +153,7 @@ impl SessionActor {
     /// `has_enabled_hooks_for_canonical` for the precise check the stop gate
     /// uses), while client hooks are checked per event.
     pub(super) fn hook_event_active(&self, event: HookEventName) -> bool {
-        self.startup_hints.actor_policy.allows_tools()
+        self.startup_hints.actor_policy.allows_hooks()
             && (self.hook_registry.borrow().is_some()
                 || self.client_hooks.borrow().contains_key(&event.canonical()))
     }
@@ -168,7 +168,9 @@ impl SessionActor {
         payload: HookPayload,
     ) -> HookEventEnvelope {
         let envelope = self.make_hook_envelope(hook_event_name, prompt_id, payload);
-        self.notify_client_hooks(&envelope);
+        if self.startup_hints.actor_policy.allows_hooks() {
+            self.notify_client_hooks(&envelope);
+        }
         envelope
     }
 

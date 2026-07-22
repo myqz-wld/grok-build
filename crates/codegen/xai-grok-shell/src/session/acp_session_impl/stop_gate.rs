@@ -253,6 +253,12 @@ impl SessionActor {
         prompt_id: &str,
         continuations_this_turn: u32,
     ) -> StopGateDecision {
+        // Annotation actors are an assistant-text-only boundary. Gate before
+        // even consulting the installed registries so neither file/client
+        // Stop hooks nor their continuation feedback can run for them.
+        if !self.startup_hints.actor_policy.allows_hooks() {
+            return StopGateDecision::AllowStop;
+        }
         let event = if self.startup_hints.is_subagent {
             event::HookEventName::SubagentStop
         } else {

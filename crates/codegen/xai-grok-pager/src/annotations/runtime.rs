@@ -47,6 +47,11 @@ pub(crate) enum AnnotationExchangePhase {
     LoadingChild,
     Prompting,
     Cancelling,
+    /// Local persistence failed after the remote prompt had started. The
+    /// exchange is already terminal in the parent UI, but its prompt identity
+    /// remains registered until the matching prompt task finishes so late
+    /// chunks and durable terminals cannot fall through to an open root view.
+    DrainingAfterStorageFailure,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +82,10 @@ impl AnnotationInFlight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnnotationPersistContinuation {
     None,
-    StartExchange { thread_id: ThreadId },
+    StartExchange {
+        thread_id: ThreadId,
+        exchange_id: ExchangeId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +104,8 @@ pub(crate) struct AnnotationRuntime {
     pub(crate) loaded_sessions: HashSet<String>,
     pub(crate) loading_sessions: HashSet<String>,
     pub(crate) last_event_seq: HashMap<String, u64>,
+    /// Monotonic, allocation-free invalidation token for each projected card.
+    pub(crate) thread_revisions: HashMap<ThreadId, u64>,
     pub(crate) persist_queue: VecDeque<AnnotationPersistRequest>,
     pub(crate) persist_in_flight: bool,
     pub(crate) warnings: Vec<AnnotationWarning>,
@@ -122,6 +132,12 @@ impl AnnotationRuntime {
             .filter(|thread| !thread.deleted)
             .map(|thread| (thread.child_session_id.clone(), thread.thread_id))
             .collect();
+        self.thread_revisions = state
+            .threads
+            .keys()
+            .copied()
+            .map(|thread_id| (thread_id, 1))
+            .collect();
         self.state = state;
         self.pending_forks.clear();
         self.in_flight.clear();
@@ -135,19 +151,32 @@ impl AnnotationRuntime {
         self.restoring = false;
     }
 
+    pub(crate) fn thread_revision(&self, thread_id: ThreadId) -> u64 {
+        self.thread_revisions.get(&thread_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn bump_thread_revision(&mut self, thread_id: ThreadId) {
+        let revision = self.thread_revisions.entry(thread_id).or_default();
+        *revision = revision.wrapping_add(1).max(1);
+    }
+
     pub(crate) fn enqueue_persist(
         &mut self,
         event: AnnotationEvent,
         continuation: AnnotationPersistContinuation,
-    ) {
+    ) -> bool {
+        if self.last_error.is_some() {
+            return false;
+        }
         self.persist_queue.push_back(AnnotationPersistRequest {
             event,
             continuation,
         });
+        true
     }
 
     pub(crate) fn start_next_persist(&mut self) -> Option<AnnotationEvent> {
-        if self.persist_in_flight {
+        if self.persist_in_flight || self.last_error.is_some() {
             return None;
         }
         let event = self.persist_queue.front()?.event.clone();
@@ -172,7 +201,7 @@ impl AnnotationRuntime {
         &mut self,
         event_id: uuid::Uuid,
         message: String,
-    ) -> Option<AnnotationPersistRequest> {
+    ) -> Option<Vec<AnnotationPersistRequest>> {
         if !self
             .persist_queue
             .front()
@@ -180,8 +209,7 @@ impl AnnotationRuntime {
         {
             return None;
         }
-        let failed = self.persist_queue.pop_front()?;
-        self.persist_queue.clear();
+        let failed = self.persist_queue.drain(..).collect::<Vec<_>>();
         self.persist_in_flight = false;
         self.last_error = Some(message);
         Some(failed)
@@ -216,5 +244,38 @@ mod tests {
             Some(second.event_id)
         );
         assert_eq!(first.schema_version, ANNOTATION_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn persistence_failure_returns_every_dropped_request_and_closes_queue() {
+        let thread_a = uuid::Uuid::from_u128(1);
+        let thread_b = uuid::Uuid::from_u128(2);
+        let first = AnnotationEvent::new(thread_a, AnnotationEventKind::ThreadDeleted);
+        let second = AnnotationEvent::new(thread_b, AnnotationEventKind::ThreadDeleted);
+        let mut runtime = AnnotationRuntime::default();
+        runtime.enqueue_persist(first.clone(), AnnotationPersistContinuation::None);
+        runtime.enqueue_persist(second.clone(), AnnotationPersistContinuation::None);
+        assert_eq!(
+            runtime.start_next_persist().unwrap().event_id,
+            first.event_id
+        );
+
+        let dropped = runtime
+            .fail_persist(first.event_id, "disk full".into())
+            .unwrap();
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|request| request.event.event_id)
+                .collect::<Vec<_>>(),
+            vec![first.event_id, second.event_id]
+        );
+        assert!(runtime.persist_queue.is_empty());
+        assert!(!runtime.persist_in_flight);
+        assert!(!runtime.enqueue_persist(
+            AnnotationEvent::new(thread_a, AnnotationEventKind::ThreadDeleted),
+            AnnotationPersistContinuation::None,
+        ));
+        assert!(runtime.start_next_persist().is_none());
     }
 }

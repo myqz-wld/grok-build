@@ -974,7 +974,7 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent_id,
             silent: true,
         });
-        let restore_annotations = !app.screen_mode.is_minimal() && !agent.chat_kind;
+        let restore_annotations = !app.screen_mode.is_minimal();
         agent.reset_annotations_for_session_load(restore_annotations);
         if restore_annotations {
             effects.push(Effect::LoadAnnotationState {

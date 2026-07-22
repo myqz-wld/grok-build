@@ -167,6 +167,12 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
             assert_eq!(prompt_id, "p1");
             assert_eq!(stop_reason, "end_turn");
             assert_eq!(agent_result, None);
+            assert_eq!(
+                turn_completed_meta(&msgs)
+                    .and_then(|meta| meta.get("promptId").cloned()),
+                Some(serde_json::json!("p1")),
+                "the durable terminal remains prompt-attributed after handle_completion clears the live pin"
+            );
 
             // ...after the flushed buffered delta on the same persistence stream.
             let delta_idx = msgs
@@ -226,6 +232,73 @@ async fn error_completion_persists_turn_completed_with_error_detail() {
             assert_eq!(prompt_id, "p-err");
             assert_eq!(stop_reason, "error");
             assert_eq!(agent_result.as_deref(), Some("boom"));
+            assert_eq!(
+                turn_completed_meta(&msgs).and_then(|meta| meta.get("promptId").cloned()),
+                Some(serde_json::json!("p-err"))
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_prompt_scoped_xai_updates_inherit_the_current_prompt_id() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("retry-prompt".to_string());
+            actor
+                .send_xai_notification(XaiSessionUpdate::RetryState(
+                    crate::extensions::notification::RetryState::Retrying {
+                        attempt: 1,
+                        max_retries: 3,
+                        reason: "transient".into(),
+                    },
+                ))
+                .await;
+            actor
+                .send_xai_notification(XaiSessionUpdate::SessionRecapUnavailable)
+                .await;
+
+            let notifications = drain_persistence(&mut persistence_rx)
+                .into_iter()
+                .filter_map(|message| match message {
+                    PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(
+                        notification,
+                    )) => Some(notification),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let retry_meta = notifications
+                .iter()
+                .find(|notification| matches!(notification.update, XaiSessionUpdate::RetryState(_)))
+                .and_then(|notification| notification.meta.as_ref())
+                .expect("retry update must carry notification metadata");
+            assert_eq!(
+                retry_meta.get("promptId").and_then(|value| value.as_str()),
+                Some("retry-prompt")
+            );
+            let recap_meta = notifications
+                .iter()
+                .find(|notification| {
+                    matches!(
+                        notification.update,
+                        XaiSessionUpdate::SessionRecapUnavailable
+                    )
+                })
+                .and_then(|notification| notification.meta.as_ref())
+                .expect("recap update must carry notification metadata");
+            assert!(
+                recap_meta.get("promptId").is_none(),
+                "session-global recap must not inherit the unrelated live prompt"
+            );
         })
         .await;
 }
@@ -268,6 +341,10 @@ async fn cancellation_persists_turn_completed_cancelled() {
             assert_eq!(prompt_id, "running");
             assert_eq!(stop_reason, "cancelled");
             assert_eq!(agent_result, None);
+            assert_eq!(
+                turn_completed_meta(&msgs).and_then(|meta| meta.get("promptId").cloned()),
+                Some(serde_json::json!("running"))
+            );
             // Ctrl+C also stamps a trigger (informational; only send_now changes client behavior).
             assert_eq!(
                 turn_completed_meta(&msgs).and_then(|m| m
@@ -337,6 +414,10 @@ async fn send_now_cancel_in_completion_race_window_still_persists_turn_completed
             assert_eq!(stop_reason, "cancelled");
             let meta = turn_completed_meta(&msgs).expect("terminal must carry _meta");
             assert_eq!(
+                meta.get("promptId").and_then(|v| v.as_str()),
+                Some("running")
+            );
+            assert_eq!(
                 meta.get("cancelTrigger").and_then(|v| v.as_str()),
                 Some("send_now"),
             );
@@ -384,6 +465,10 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
             assert_eq!(stop_reason, "cancelled");
             let meta = turn_completed_meta(&msgs).expect("terminal must carry _meta");
             assert_eq!(
+                meta.get("promptId").and_then(|v| v.as_str()),
+                Some("running")
+            );
+            assert_eq!(
                 meta.get("cancelTrigger").and_then(|v| v.as_str()),
                 Some("send_now"),
                 "the terminal `_meta` must carry cancelTrigger=send_now"
@@ -401,6 +486,10 @@ async fn send_now_cancel_stamps_cancel_trigger_on_turn_end() {
                 }
             }
             let wire_meta = wire_meta.expect("the TurnCompleted terminal must reach the wire");
+            assert_eq!(
+                wire_meta["promptId"], "running",
+                "wire `_meta.promptId` must identify the completed prompt"
+            );
             assert_eq!(
                 wire_meta["cancelTrigger"], "send_now",
                 "wire `_meta.cancelTrigger` must be send_now"

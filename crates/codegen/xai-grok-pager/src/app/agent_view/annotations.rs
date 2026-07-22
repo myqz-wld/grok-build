@@ -1,6 +1,7 @@
 //! Parent-owned orchestration for hidden inline-annotation sessions.
 
 use std::time::Instant;
+use std::{collections::HashMap, collections::HashSet};
 
 use agent_client_protocol as acp;
 
@@ -15,6 +16,13 @@ use crate::app::actions::Effect;
 use crate::app::agent::AgentId;
 
 impl AgentView {
+    pub(crate) fn annotation_storage_unavailable(&self) -> Option<String> {
+        self.annotation_runtime
+            .last_error
+            .as_ref()
+            .map(|message| format!("Annotation storage is unavailable: {message}"))
+    }
+
     pub(crate) fn reset_annotations_for_session_load(&mut self, restoring: bool) {
         self.annotation_runtime = Default::default();
         self.annotation_runtime.restoring = restoring;
@@ -28,6 +36,9 @@ impl AgentView {
         anchor: AnnotationAnchor,
         question: String,
     ) -> Result<Effect, String> {
+        if let Some(message) = self.annotation_storage_unavailable() {
+            return Err(message);
+        }
         let question = question.trim().to_string();
         if question.is_empty() {
             return Err("Enter a question for the selected text".to_string());
@@ -72,6 +83,9 @@ impl AgentView {
         thread_id: ThreadId,
         question: String,
     ) -> Result<Vec<Effect>, String> {
+        if let Some(message) = self.annotation_storage_unavailable() {
+            return Err(message);
+        }
         let question = question.trim().to_string();
         if question.is_empty() {
             return Err("Enter a follow-up question".to_string());
@@ -107,7 +121,10 @@ impl AgentView {
         );
         self.annotation_runtime.enqueue_persist(
             event,
-            AnnotationPersistContinuation::StartExchange { thread_id },
+            AnnotationPersistContinuation::StartExchange {
+                thread_id,
+                exchange_id,
+            },
         );
         Ok(self.kick_annotation_persist(agent_id))
     }
@@ -116,14 +133,14 @@ impl AgentView {
         &mut self,
         agent_id: AgentId,
         thread_id: ThreadId,
-    ) -> Result<Effect, String> {
+    ) -> Result<Vec<Effect>, String> {
         let in_flight = self
             .annotation_runtime
             .in_flight
-            .get_mut(&thread_id)
+            .get(&thread_id)
             .ok_or_else(|| "This annotation has no active answer".to_string())?;
         let exchange_id = in_flight.exchange_id;
-        in_flight.phase = AnnotationExchangePhase::Cancelling;
+        let phase = in_flight.phase;
         let child_session_id = self
             .annotation_runtime
             .state
@@ -131,12 +148,40 @@ impl AgentView {
             .get(&thread_id)
             .map(|thread| thread.child_session_id.clone())
             .ok_or_else(|| "Annotation thread not found".to_string())?;
-        Ok(Effect::CancelAnnotation {
-            agent_id,
-            thread_id,
-            exchange_id,
-            session_id: acp::SessionId::new(child_session_id),
-        })
+        match phase {
+            AnnotationExchangePhase::Persisting | AnnotationExchangePhase::LoadingChild => {
+                if matches!(phase, AnnotationExchangePhase::LoadingChild) {
+                    self.annotation_runtime
+                        .loading_sessions
+                        .remove(&child_session_id);
+                }
+                Ok(self.finish_annotation_exchange(
+                    agent_id,
+                    thread_id,
+                    exchange_id,
+                    Some("Cancelled".into()),
+                ))
+            }
+            AnnotationExchangePhase::Prompting => {
+                self.annotation_runtime
+                    .in_flight
+                    .get_mut(&thread_id)
+                    .expect("in-flight exchange was just read")
+                    .phase = AnnotationExchangePhase::Cancelling;
+                Ok(vec![Effect::CancelAnnotation {
+                    agent_id,
+                    thread_id,
+                    exchange_id,
+                    session_id: acp::SessionId::new(child_session_id),
+                }])
+            }
+            AnnotationExchangePhase::Cancelling => {
+                Err("This annotation is already cancelling".into())
+            }
+            AnnotationExchangePhase::DrainingAfterStorageFailure => {
+                Err("This annotation is draining after a storage failure".into())
+            }
+        }
     }
 
     pub(crate) fn delete_annotation(
@@ -144,6 +189,9 @@ impl AgentView {
         agent_id: AgentId,
         thread_id: ThreadId,
     ) -> Result<Vec<Effect>, String> {
+        if let Some(message) = self.annotation_storage_unavailable() {
+            return Err(message);
+        }
         if self.annotation_runtime.in_flight.contains_key(&thread_id) {
             return Err("Cancel the active answer before deleting this annotation".into());
         }
@@ -174,6 +222,14 @@ impl AgentView {
         exchange_id: ExchangeId,
         child_session_id: acp::SessionId,
     ) -> Vec<Effect> {
+        if let Some(message) = self.annotation_storage_unavailable() {
+            self.annotation_fork_failed(
+                thread_id,
+                exchange_id,
+                format!("Couldn't save annotation: {message}"),
+            );
+            return Vec::new();
+        }
         let Some(pending) = self.annotation_runtime.pending_forks.remove(&thread_id) else {
             return Vec::new();
         };
@@ -218,7 +274,10 @@ impl AgentView {
             .enqueue_persist(created, AnnotationPersistContinuation::None);
         self.annotation_runtime.enqueue_persist(
             started,
-            AnnotationPersistContinuation::StartExchange { thread_id },
+            AnnotationPersistContinuation::StartExchange {
+                thread_id,
+                exchange_id,
+            },
         );
         self.kick_annotation_persist(agent_id)
     }
@@ -259,28 +318,73 @@ impl AgentView {
         };
         let mut effects = match continuation {
             AnnotationPersistContinuation::None => Vec::new(),
-            AnnotationPersistContinuation::StartExchange { thread_id } => {
-                self.start_annotation_exchange(agent_id, thread_id)
-            }
+            AnnotationPersistContinuation::StartExchange {
+                thread_id,
+                exchange_id,
+            } => self.start_annotation_exchange(
+                agent_id,
+                thread_id,
+                exchange_id,
+                AnnotationExchangePhase::Persisting,
+            ),
         };
         effects.extend(self.kick_annotation_persist(agent_id));
         effects
     }
 
-    pub(crate) fn annotation_persist_failed(&mut self, event_id: uuid::Uuid, message: String) {
-        let Some(failed) = self
+    pub(crate) fn annotation_persist_failed(
+        &mut self,
+        agent_id: AgentId,
+        event_id: uuid::Uuid,
+        message: String,
+    ) -> Vec<Effect> {
+        let Some(dropped) = self
             .annotation_runtime
             .fail_persist(event_id, message.clone())
         else {
-            return;
+            return Vec::new();
         };
-        let thread_id = failed.event.thread_id;
-        if let AnnotationEventKind::ThreadCreated {
-            anchor,
-            first_question,
-            ..
-        } = &failed.event.kind
-        {
+
+        let failure = format!("Couldn't save annotation: {message}");
+        let mut effects = Vec::new();
+        let mut affected_threads = self
+            .annotation_runtime
+            .in_flight
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut affected_exchanges: HashMap<ThreadId, HashSet<ExchangeId>> = HashMap::new();
+        let mut creations = Vec::new();
+        let mut deletions = HashSet::new();
+        for request in &dropped {
+            let thread_id = request.event.thread_id;
+            affected_threads.insert(thread_id);
+            match &request.event.kind {
+                AnnotationEventKind::ThreadCreated {
+                    anchor,
+                    first_question,
+                    ..
+                } => creations.push((thread_id, anchor.clone(), first_question.clone())),
+                AnnotationEventKind::ExchangeStarted { exchange_id, .. }
+                | AnnotationEventKind::AnswerCheckpoint { exchange_id, .. }
+                | AnnotationEventKind::ExchangeCompleted { exchange_id }
+                | AnnotationEventKind::ExchangeFailed { exchange_id, .. } => {
+                    affected_exchanges
+                        .entry(thread_id)
+                        .or_default()
+                        .insert(*exchange_id);
+                }
+                AnnotationEventKind::ThreadDeleted => {
+                    deletions.insert(thread_id);
+                }
+            }
+        }
+
+        let creation_threads = creations
+            .iter()
+            .map(|(thread_id, _, _)| *thread_id)
+            .collect::<HashSet<_>>();
+        for (thread_id, anchor, first_question) in creations {
             // The child exists, but without its creation event the parent log
             // cannot recover this thread. Remove the optimistic state and put
             // the original draft back into the same retryable failure state as
@@ -290,6 +394,11 @@ impl AgentView {
                 .in_flight
                 .remove(&thread_id)
                 .map(|in_flight| in_flight.exchange_id)
+                .or_else(|| {
+                    affected_exchanges
+                        .get(&thread_id)
+                        .and_then(|ids| ids.iter().next().copied())
+                })
                 .unwrap_or_else(uuid::Uuid::new_v4);
             if let Some(thread) = self.annotation_runtime.state.threads.remove(&thread_id) {
                 self.annotation_runtime
@@ -305,56 +414,155 @@ impl AgentView {
                     .last_event_seq
                     .remove(&thread.child_session_id);
             }
+            self.annotation_runtime.thread_revisions.remove(&thread_id);
             self.annotation_ui.expanded_threads.remove(&thread_id);
             self.annotation_runtime.pending_forks.insert(
                 thread_id,
                 PendingAnnotationFork::Failed {
-                    anchor: anchor.clone(),
-                    question: first_question.clone(),
+                    anchor,
+                    question: first_question,
                     exchange_id,
-                    message: format!("Couldn't save annotation: {message}"),
+                    message: failure.clone(),
                 },
             );
-        } else if matches!(failed.event.kind, AnnotationEventKind::ThreadDeleted)
-            && let Some(thread) = self.annotation_runtime.state.threads.get_mut(&thread_id)
-        {
-            thread.deleted = false;
-            self.annotation_runtime
-                .sessions
-                .insert(thread.child_session_id.clone(), thread_id);
         }
-        if let Some(in_flight) = self.annotation_runtime.in_flight.remove(&thread_id)
-            && let Some(exchange) = self.annotation_exchange_mut(thread_id, in_flight.exchange_id)
-        {
-            exchange.status = AnnotationExchangeStatus::Failed {
-                message: format!("Couldn't save annotation: {message}"),
-            };
+
+        for thread_id in deletions.difference(&creation_threads).copied() {
+            if let Some(thread) = self.annotation_runtime.state.threads.get_mut(&thread_id) {
+                thread.deleted = false;
+                self.annotation_runtime
+                    .sessions
+                    .insert(thread.child_session_id.clone(), thread_id);
+            }
         }
-        self.show_toast(&format!("Couldn't save annotation: {message}"));
+
+        for thread_id in affected_threads.difference(&creation_threads).copied() {
+            if let Some(in_flight) = self.annotation_runtime.in_flight.get(&thread_id) {
+                affected_exchanges
+                    .entry(thread_id)
+                    .or_default()
+                    .insert(in_flight.exchange_id);
+            }
+            let in_flight = self
+                .annotation_runtime
+                .in_flight
+                .get(&thread_id)
+                .map(|in_flight| (in_flight.exchange_id, in_flight.phase));
+            if let Some((exchange_id, phase)) = in_flight {
+                let child_session_id = self
+                    .annotation_runtime
+                    .state
+                    .threads
+                    .get(&thread_id)
+                    .map(|thread| thread.child_session_id.clone());
+                match phase {
+                    AnnotationExchangePhase::Prompting => {
+                        if let Some(in_flight) =
+                            self.annotation_runtime.in_flight.get_mut(&thread_id)
+                        {
+                            in_flight.phase = AnnotationExchangePhase::DrainingAfterStorageFailure;
+                        }
+                        if let Some(child_session_id) = child_session_id {
+                            effects.push(Effect::CancelAnnotation {
+                                agent_id,
+                                thread_id,
+                                exchange_id,
+                                session_id: acp::SessionId::new(child_session_id),
+                            });
+                        }
+                    }
+                    AnnotationExchangePhase::Cancelling
+                    | AnnotationExchangePhase::DrainingAfterStorageFailure => {
+                        // Cancellation is already on the wire. Keep the prompt
+                        // identity until its matching terminal is observed,
+                        // but never send a duplicate ACP cancellation.
+                        if let Some(in_flight) =
+                            self.annotation_runtime.in_flight.get_mut(&thread_id)
+                        {
+                            in_flight.phase = AnnotationExchangePhase::DrainingAfterStorageFailure;
+                        }
+                    }
+                    AnnotationExchangePhase::Persisting | AnnotationExchangePhase::LoadingChild => {
+                        // No remote prompt exists yet, so local reconciliation
+                        // is sufficient and an ACP cancel would target unrelated
+                        // work in a coexisting child root.
+                        self.annotation_runtime.in_flight.remove(&thread_id);
+                        if matches!(phase, AnnotationExchangePhase::LoadingChild)
+                            && let Some(child_session_id) = child_session_id
+                        {
+                            self.annotation_runtime
+                                .loading_sessions
+                                .remove(&child_session_id);
+                        }
+                    }
+                }
+            }
+            if let Some(exchange_ids) = affected_exchanges.get(&thread_id) {
+                for exchange_id in exchange_ids {
+                    if let Some(exchange) = self.annotation_exchange_mut(thread_id, *exchange_id) {
+                        exchange.status = AnnotationExchangeStatus::Failed {
+                            message: failure.clone(),
+                        };
+                    }
+                }
+            }
+            self.annotation_runtime.bump_thread_revision(thread_id);
+        }
+        self.show_toast(&failure);
+        effects
     }
 
     pub(crate) fn annotation_session_loaded(
         &mut self,
         agent_id: AgentId,
         thread_id: ThreadId,
+        exchange_id: ExchangeId,
         session_id: &acp::SessionId,
     ) -> Vec<Effect> {
         let session_id = session_id.to_string();
         if self.annotation_runtime.sessions.get(&session_id) != Some(&thread_id) {
             return Vec::new();
         }
+        if !self
+            .annotation_runtime
+            .in_flight
+            .get(&thread_id)
+            .is_some_and(|in_flight| {
+                in_flight.exchange_id == exchange_id
+                    && matches!(in_flight.phase, AnnotationExchangePhase::LoadingChild)
+            })
+        {
+            return Vec::new();
+        }
         self.annotation_runtime.loading_sessions.remove(&session_id);
         self.annotation_runtime.loaded_sessions.insert(session_id);
-        self.start_annotation_exchange(agent_id, thread_id)
+        self.start_annotation_exchange(
+            agent_id,
+            thread_id,
+            exchange_id,
+            AnnotationExchangePhase::LoadingChild,
+        )
     }
 
     pub(crate) fn annotation_session_load_failed(
         &mut self,
         agent_id: AgentId,
         thread_id: ThreadId,
+        exchange_id: ExchangeId,
         session_id: &acp::SessionId,
         message: String,
     ) -> Vec<Effect> {
+        if !self
+            .annotation_runtime
+            .in_flight
+            .get(&thread_id)
+            .is_some_and(|in_flight| {
+                in_flight.exchange_id == exchange_id
+                    && matches!(in_flight.phase, AnnotationExchangePhase::LoadingChild)
+            })
+        {
+            return Vec::new();
+        }
         self.annotation_runtime
             .loading_sessions
             .remove(session_id.0.as_ref());
@@ -380,6 +588,22 @@ impl AgentView {
             return Vec::new();
         };
         if in_flight.exchange_id != exchange_id || in_flight.prompt_id != prompt_id {
+            return Vec::new();
+        }
+        if matches!(
+            in_flight.phase,
+            AnnotationExchangePhase::DrainingAfterStorageFailure
+        ) {
+            // The storage failure already made the local exchange terminal.
+            // This matching prompt result only releases the routing tombstone;
+            // it must not overwrite the failure or enqueue more persistence.
+            self.annotation_runtime.in_flight.remove(&thread_id);
+            return Vec::new();
+        }
+        if !matches!(
+            in_flight.phase,
+            AnnotationExchangePhase::Prompting | AnnotationExchangePhase::Cancelling
+        ) {
             return Vec::new();
         }
         match result {
@@ -410,7 +634,9 @@ impl AgentView {
         let Some(in_flight) = self.annotation_runtime.in_flight.get(&thread_id) else {
             return Vec::new();
         };
-        if in_flight.exchange_id != exchange_id {
+        if in_flight.exchange_id != exchange_id
+            || !matches!(in_flight.phase, AnnotationExchangePhase::Cancelling)
+        {
             return Vec::new();
         }
         self.finish_annotation_exchange(agent_id, thread_id, exchange_id, Some(result.unwrap_err()))
@@ -440,6 +666,12 @@ impl AgentView {
         let Some(in_flight) = self.annotation_runtime.in_flight.get(&thread_id) else {
             return false;
         };
+        if !matches!(
+            in_flight.phase,
+            AnnotationExchangePhase::Prompting | AnnotationExchangePhase::Cancelling
+        ) {
+            return false;
+        }
         if meta
             .prompt_id
             .as_deref()
@@ -468,6 +700,7 @@ impl AgentView {
         exchange.answer_markdown.push_str(&text.text);
         exchange.updated_at = chrono::Utc::now();
         let snapshot = exchange.answer_markdown.clone();
+        self.annotation_runtime.bump_thread_revision(thread_id);
         let checkpoint = self
             .annotation_runtime
             .in_flight
@@ -494,7 +727,23 @@ impl AgentView {
         true
     }
 
-    fn start_annotation_exchange(&mut self, agent_id: AgentId, thread_id: ThreadId) -> Vec<Effect> {
+    fn start_annotation_exchange(
+        &mut self,
+        agent_id: AgentId,
+        thread_id: ThreadId,
+        exchange_id: ExchangeId,
+        expected_phase: AnnotationExchangePhase,
+    ) -> Vec<Effect> {
+        if !self
+            .annotation_runtime
+            .in_flight
+            .get(&thread_id)
+            .is_some_and(|in_flight| {
+                in_flight.exchange_id == exchange_id && in_flight.phase == expected_phase
+            })
+        {
+            return Vec::new();
+        }
         let Some(thread) = self.annotation_runtime.state.threads.get(&thread_id) else {
             return Vec::new();
         };
@@ -515,6 +764,7 @@ impl AgentView {
                 return vec![Effect::LoadAnnotationSession {
                     agent_id,
                     thread_id,
+                    exchange_id,
                     session_id: acp::SessionId::new(child_session_id),
                     cwd: self.session.cwd.clone(),
                 }];
@@ -526,7 +776,6 @@ impl AgentView {
             return Vec::new();
         };
         in_flight.phase = AnnotationExchangePhase::Prompting;
-        let exchange_id = in_flight.exchange_id;
         let prompt_id = in_flight.prompt_id.clone();
         let question = in_flight.question.clone();
         let is_initial = thread
@@ -624,8 +873,11 @@ impl AgentView {
     }
 
     fn apply_annotation_event(&mut self, event: AnnotationEvent) {
+        let thread_id = event.thread_id;
         if let Some(warning) = self.annotation_runtime.state.apply(event) {
             self.annotation_runtime.warnings.push(warning);
+        } else {
+            self.annotation_runtime.bump_thread_revision(thread_id);
         }
     }
 
@@ -797,8 +1049,12 @@ mod tests {
             load.as_slice(),
             [Effect::LoadAnnotationSession { session_id, .. }] if session_id.0.as_ref() == "child"
         ));
-        let prompt =
-            agent.annotation_session_loaded(AgentId(0), thread_id, &acp::SessionId::new("child"));
+        let prompt = agent.annotation_session_loaded(
+            AgentId(0),
+            thread_id,
+            exchange_id,
+            &acp::SessionId::new("child"),
+        );
         assert!(matches!(
             prompt.as_slice(),
             [Effect::PromptAnnotation { session_id, exchange_id: id, .. }]
@@ -934,15 +1190,118 @@ mod tests {
         let thread_id = uuid::Uuid::from_u128(40);
         let exchange_id = uuid::Uuid::from_u128(41);
         prime_thread(&mut agent, thread_id, exchange_id, "child-cancel", "Stop?");
-        let effect = agent.cancel_annotation(AgentId(0), thread_id).unwrap();
+        let effects = agent.cancel_annotation(AgentId(0), thread_id).unwrap();
         assert!(matches!(
-            effect,
-            Effect::CancelAnnotation { session_id, thread_id: id, .. }
-                if session_id.0.as_ref() == "child-cancel" && id == thread_id
+            effects.as_slice(),
+            [Effect::CancelAnnotation { session_id, thread_id: id, .. }]
+                if session_id.0.as_ref() == "child-cancel" && *id == thread_id
         ));
         assert_eq!(
             agent.annotation_runtime.in_flight[&thread_id].phase,
             AnnotationExchangePhase::Cancelling
+        );
+    }
+
+    #[test]
+    fn cancel_while_persisting_finishes_locally_and_blocks_start_continuation() {
+        let mut agent = agent();
+        let thread_id = uuid::Uuid::from_u128(42);
+        let first_exchange = uuid::Uuid::from_u128(43);
+        prime_thread(
+            &mut agent,
+            thread_id,
+            first_exchange,
+            "child-persisting",
+            "First?",
+        );
+        agent.annotation_runtime.in_flight.remove(&thread_id);
+        agent
+            .annotation_runtime
+            .state
+            .threads
+            .get_mut(&thread_id)
+            .unwrap()
+            .exchanges[0]
+            .status = AnnotationExchangeStatus::Completed;
+        let persist = agent
+            .begin_annotation_follow_up(AgentId(0), thread_id, "Cancel early".into())
+            .unwrap();
+        let started_event_id = persist_id(&persist[0]);
+        let exchange_id =
+            agent.annotation_runtime.state.threads[&thread_id].exchanges[1].exchange_id;
+
+        let cancel_effects = agent.cancel_annotation(AgentId(0), thread_id).unwrap();
+        assert!(
+            cancel_effects.is_empty(),
+            "pre-prompt cancellation must not send ACP cancel while the start event is appending"
+        );
+        assert!(!agent.annotation_runtime.in_flight.contains_key(&thread_id));
+        assert!(matches!(
+            &agent.annotation_runtime.state.threads[&thread_id].exchanges[1].status,
+            AnnotationExchangeStatus::Failed { message } if message == "Cancelled"
+        ));
+
+        let next = agent.annotation_persist_finished(AgentId(0), started_event_id);
+        assert!(matches!(
+            next.as_slice(),
+            [Effect::PersistAnnotationEvent { event, .. }]
+                if matches!(event.kind, AnnotationEventKind::ExchangeFailed { exchange_id: id, .. } if id == exchange_id)
+        ));
+        assert!(!next.iter().any(|effect| matches!(
+            effect,
+            Effect::LoadAnnotationSession { .. } | Effect::PromptAnnotation { .. }
+        )));
+    }
+
+    #[test]
+    fn cancel_while_loading_child_ignores_stale_load_completion() {
+        let mut agent = agent();
+        let thread_id = uuid::Uuid::from_u128(44);
+        let exchange_id = uuid::Uuid::from_u128(45);
+        prime_thread(
+            &mut agent,
+            thread_id,
+            exchange_id,
+            "child-loading",
+            "Stop loading?",
+        );
+        agent
+            .annotation_runtime
+            .in_flight
+            .get_mut(&thread_id)
+            .unwrap()
+            .phase = AnnotationExchangePhase::LoadingChild;
+        agent
+            .annotation_runtime
+            .loading_sessions
+            .insert("child-loading".into());
+
+        let effects = agent.cancel_annotation(AgentId(0), thread_id).unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PersistAnnotationEvent { event, .. }]
+                if matches!(event.kind, AnnotationEventKind::ExchangeFailed { exchange_id: id, .. } if id == exchange_id)
+        ));
+        assert!(!agent.annotation_runtime.in_flight.contains_key(&thread_id));
+        assert!(
+            !agent
+                .annotation_runtime
+                .loading_sessions
+                .contains("child-loading")
+        );
+
+        let stale = agent.annotation_session_loaded(
+            AgentId(0),
+            thread_id,
+            exchange_id,
+            &acp::SessionId::new("child-loading"),
+        );
+        assert!(stale.is_empty());
+        assert!(
+            !agent
+                .annotation_runtime
+                .loaded_sessions
+                .contains("child-loading")
         );
     }
 
@@ -975,7 +1334,7 @@ mod tests {
         ));
 
         let event_id = persist_id(&effects[0]);
-        agent.annotation_persist_failed(event_id, "disk full".into());
+        agent.annotation_persist_failed(AgentId(0), event_id, "disk full".into());
         assert!(!agent.annotation_runtime.state.threads[&thread_id].deleted);
         assert_eq!(
             agent.annotation_runtime.sessions.get("child-delete"),
@@ -1009,7 +1368,7 @@ mod tests {
         );
         let event_id = persist_id(&persist[0]);
 
-        agent.annotation_persist_failed(event_id, "disk full".into());
+        agent.annotation_persist_failed(AgentId(0), event_id, "disk full".into());
 
         assert!(
             !agent
@@ -1037,6 +1396,263 @@ mod tests {
                 && *id == exchange_id
                 && message.contains("disk full")
         ));
+    }
+
+    #[test]
+    fn persist_failure_reconciles_queued_work_for_multiple_threads() {
+        let mut agent = agent();
+        let thread_a = uuid::Uuid::from_u128(70);
+        let thread_b = uuid::Uuid::from_u128(80);
+        prime_thread(
+            &mut agent,
+            thread_a,
+            uuid::Uuid::from_u128(71),
+            "child-a",
+            "A?",
+        );
+        prime_thread(
+            &mut agent,
+            thread_b,
+            uuid::Uuid::from_u128(81),
+            "child-b",
+            "B?",
+        );
+        for thread_id in [thread_a, thread_b] {
+            agent.annotation_runtime.in_flight.remove(&thread_id);
+            agent
+                .annotation_runtime
+                .state
+                .threads
+                .get_mut(&thread_id)
+                .unwrap()
+                .exchanges[0]
+                .status = AnnotationExchangeStatus::Completed;
+        }
+
+        let first = agent
+            .begin_annotation_follow_up(AgentId(0), thread_a, "A follow-up".into())
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let failed_event_id = persist_id(&first[0]);
+        assert!(
+            agent
+                .begin_annotation_follow_up(AgentId(0), thread_b, "B follow-up".into())
+                .unwrap()
+                .is_empty(),
+            "thread B queues behind thread A's in-flight append"
+        );
+        let exchange_a = agent.annotation_runtime.state.threads[&thread_a].exchanges[1].exchange_id;
+        let exchange_b = agent.annotation_runtime.state.threads[&thread_b].exchanges[1].exchange_id;
+
+        agent.annotation_persist_failed(AgentId(0), failed_event_id, "disk full".into());
+
+        assert!(agent.annotation_runtime.persist_queue.is_empty());
+        assert!(agent.annotation_runtime.in_flight.is_empty());
+        for (thread_id, exchange_id) in [(thread_a, exchange_a), (thread_b, exchange_b)] {
+            let exchange = agent.annotation_runtime.state.threads[&thread_id]
+                .exchanges
+                .iter()
+                .find(|exchange| exchange.exchange_id == exchange_id)
+                .unwrap();
+            assert!(matches!(
+                &exchange.status,
+                AnnotationExchangeStatus::Failed { message } if message.contains("disk full")
+            ));
+        }
+        assert!(
+            agent
+                .begin_annotation_follow_up(AgentId(0), thread_a, "retry".into())
+                .unwrap_err()
+                .contains("storage is unavailable")
+        );
+    }
+
+    #[test]
+    fn terminal_event_persist_failure_replaces_optimistic_completion() {
+        let mut agent = agent();
+        let thread_id = uuid::Uuid::from_u128(90);
+        let exchange_id = uuid::Uuid::from_u128(91);
+        prime_thread(&mut agent, thread_id, exchange_id, "child", "Finish?");
+        let prompt_id = agent.annotation_runtime.in_flight[&thread_id]
+            .prompt_id
+            .clone();
+
+        let effects = agent.annotation_prompt_finished(
+            AgentId(0),
+            thread_id,
+            exchange_id,
+            &prompt_id,
+            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+        );
+        assert!(matches!(
+            agent.annotation_runtime.state.threads[&thread_id].exchanges[0].status,
+            AnnotationExchangeStatus::Completed
+        ));
+
+        agent.annotation_persist_failed(
+            AgentId(0),
+            persist_id(&effects[0]),
+            "read-only filesystem".into(),
+        );
+
+        assert!(matches!(
+            &agent.annotation_runtime.state.threads[&thread_id].exchanges[0].status,
+            AnnotationExchangeStatus::Failed { message }
+                if message.contains("read-only filesystem")
+        ));
+        assert!(agent.annotation_runtime.persist_queue.is_empty());
+    }
+
+    #[test]
+    fn persist_failure_cancels_active_prompts_and_keeps_ownership_until_terminal() {
+        let mut agent = agent();
+        let thread_a = uuid::Uuid::from_u128(100);
+        let exchange_a = uuid::Uuid::from_u128(101);
+        let thread_b = uuid::Uuid::from_u128(110);
+        let exchange_b = uuid::Uuid::from_u128(111);
+        prime_thread(&mut agent, thread_a, exchange_a, "child-a", "A?");
+        prime_thread(&mut agent, thread_b, exchange_b, "child-b", "B?");
+        let prompt_a = agent.annotation_runtime.in_flight[&thread_a]
+            .prompt_id
+            .clone();
+        let prompt_b = agent.annotation_runtime.in_flight[&thread_b]
+            .prompt_id
+            .clone();
+
+        let checkpoint = AnnotationEvent::new(
+            thread_a,
+            AnnotationEventKind::AnswerCheckpoint {
+                exchange_id: exchange_a,
+                markdown: "partial A".into(),
+            },
+        );
+        agent.apply_annotation_event(checkpoint.clone());
+        assert!(
+            agent
+                .annotation_runtime
+                .enqueue_persist(checkpoint, AnnotationPersistContinuation::None,)
+        );
+        let persist = agent.kick_annotation_persist(AgentId(0));
+        let effects = agent.annotation_persist_failed(
+            AgentId(0),
+            persist_id(&persist[0]),
+            "disk full".into(),
+        );
+
+        let cancelled = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::CancelAnnotation {
+                    thread_id,
+                    session_id,
+                    ..
+                } => Some((*thread_id, session_id.to_string())),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            cancelled,
+            HashSet::from([
+                (thread_a, "child-a".to_string()),
+                (thread_b, "child-b".to_string()),
+            ])
+        );
+        for (thread_id, exchange_id) in [(thread_a, exchange_a), (thread_b, exchange_b)] {
+            assert_eq!(
+                agent.annotation_runtime.in_flight[&thread_id].phase,
+                AnnotationExchangePhase::DrainingAfterStorageFailure
+            );
+            assert!(matches!(
+                &agent.annotation_runtime.state.threads[&thread_id]
+                    .exchanges
+                    .iter()
+                    .find(|exchange| exchange.exchange_id == exchange_id)
+                    .unwrap()
+                    .status,
+                AnnotationExchangeStatus::Failed { message } if message.contains("disk full")
+            ));
+        }
+
+        let late_meta =
+            NotificationMeta::from_json(serde_json::json!({ "promptId": prompt_a }).as_object());
+        assert!(
+            !agent.handle_annotation_update(
+                AgentId(0),
+                "child-a",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("late chunk")),
+                )),
+                &late_meta,
+            ),
+            "late remote output is owned but must not mutate the failed exchange"
+        );
+        assert_eq!(
+            agent.annotation_runtime.state.threads[&thread_a].exchanges[0].answer_markdown,
+            "partial A"
+        );
+
+        for (thread_id, exchange_id, prompt_id) in [
+            (thread_a, exchange_a, prompt_a.as_str()),
+            (thread_b, exchange_b, prompt_b.as_str()),
+        ] {
+            assert!(
+                agent
+                    .annotation_prompt_finished(
+                        AgentId(0),
+                        thread_id,
+                        exchange_id,
+                        prompt_id,
+                        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+                    )
+                    .is_empty(),
+                "drain terminals must not attempt another persistence append"
+            );
+            assert!(!agent.annotation_runtime.in_flight.contains_key(&thread_id));
+            assert!(matches!(
+                &agent.annotation_runtime.state.threads[&thread_id].exchanges[0].status,
+                AnnotationExchangeStatus::Failed { message } if message.contains("disk full")
+            ));
+        }
+    }
+
+    #[test]
+    fn persist_failure_does_not_duplicate_an_existing_remote_cancel() {
+        let mut agent = agent();
+        let thread_id = uuid::Uuid::from_u128(120);
+        let exchange_id = uuid::Uuid::from_u128(121);
+        prime_thread(&mut agent, thread_id, exchange_id, "child", "Cancel?");
+        agent
+            .annotation_runtime
+            .in_flight
+            .get_mut(&thread_id)
+            .unwrap()
+            .phase = AnnotationExchangePhase::Cancelling;
+
+        let checkpoint = AnnotationEvent::new(
+            thread_id,
+            AnnotationEventKind::AnswerCheckpoint {
+                exchange_id,
+                markdown: "partial".into(),
+            },
+        );
+        agent.apply_annotation_event(checkpoint.clone());
+        assert!(
+            agent
+                .annotation_runtime
+                .enqueue_persist(checkpoint, AnnotationPersistContinuation::None,)
+        );
+        let persist = agent.kick_annotation_persist(AgentId(0));
+        let effects = agent.annotation_persist_failed(
+            AgentId(0),
+            persist_id(&persist[0]),
+            "disk full".into(),
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            agent.annotation_runtime.in_flight[&thread_id].phase,
+            AnnotationExchangePhase::DrainingAfterStorageFailure
+        );
     }
 
     #[test]

@@ -86,7 +86,14 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
 
     // Resolve the owning agent before the queue is replaced.
     let sid = acp::SessionId::new(session_id.clone());
-    let agent_id = match find_session_match(app, &sid) {
+    let matched = find_session_match_for_prompt(app, &sid, running_prompt_id.as_deref());
+    if matches!(matched, Some(SessionMatch::Annotation { .. })) {
+        // Hidden annotation prompts never participate in the visible shared
+        // queue. In particular, do not let their running-slot broadcasts
+        // mutate an ordinary root view opened on the same child session.
+        return false;
+    }
+    let agent_id = match matched {
         Some(SessionMatch::Root(id)) => Some(id),
         _ => None,
     };
@@ -391,7 +398,9 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     let session_id = payload.session_id.as_str();
 
     let sid = acp::SessionId::new(session_id.to_string());
-    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+    let Some(SessionMatch::Root(id)) =
+        find_session_match_for_prompt(app, &sid, payload.prompt_id.as_deref())
+    else {
         return false;
     };
     let is_active = is_matched_agent_active(app, id);

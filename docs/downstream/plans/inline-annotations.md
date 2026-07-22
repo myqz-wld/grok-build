@@ -297,6 +297,45 @@ Acceptance: keyboard-only and mouse flows work; cancel creates no child; card st
 
 Acceptance: validations below pass or any environmental failure is recorded with the exact command/output and no known product regression remains.
 
+### T8 — Post-delivery review remediation
+
+Remediate all eight findings confirmed by the independent review of
+`ba76b0a..4928862` without reopening the approved product decisions:
+
+1. Preserve raw Markdown source identity at selectable span/column granularity so
+   text on either side of a collapsed soft break anchors to its own semantic line.
+2. Gate direct `SessionStart` and both `SessionEnd` lifecycle-hook paths with the
+   persisted annotation actor policy, covering both client and file hooks.
+3. Keep Open child available while routing annotation notifications by the
+   running annotation prompt, so a coexisting root view cannot steal a follow-up.
+4. Make append failures reconcile every queued persistence request and leave no
+   unrelated thread stranded in an optimistic or in-flight state.
+5. Cancel Persisting/LoadingChild exchanges locally, persist a terminal state,
+   and require exchange/phase matches before every later continuation.
+6. Restore annotations for every persisted non-minimal parent, including
+   chat-kind sessions, and reject creation clearly only when no local persistence
+   target exists.
+7. Cache expanded-card Markdown/layout by content revision, width, theme, and
+   expansion state so idle, hover, and duplicate streaming-revision redraws do
+   not reparse or rehash unchanged answer text.
+8. Surface concise, non-blocking annotation-load recovery warnings and errors.
+
+Add focused regression coverage for collapsed soft breaks at multiple widths
+(including CJK/formatting), all lifecycle-hook paths, root/annotation routing
+coexistence, multi-thread and terminal append failures, cancellation in every
+pre-prompt phase, chat-kind reload, render-cache hits/invalidation, and load
+diagnostics. Run the complete validation plan plus standard/minimal smoke checks
+and record baseline-only failures precisely.
+
+Final review uses one retained `gpt-5.6-sol` reviewer at `max` thinking. Reuse
+that same child session for every fix/re-review round until it explicitly passes;
+do not replace it or add parallel reviewers.
+
+Acceptance: all eight regressions are fixed with focused tests; the full pager and
+shell validation is no worse than the recorded `main@ba76b0a` baseline; the fix is
+committed and pushed on `fix/inline-annotations-review`, then fast-forwarded and
+pushed to `feature/inline-annotations`; pristine `main` remains unchanged.
+
 ## 9. Validation plan
 
 Run the narrowest tests during development, then:
@@ -333,7 +372,7 @@ Manual smoke test in a standard TUI:
 
 ## 11. Known risks and mitigations
 
-- Markdown source maps can be many-to-one after wrapping. Mitigation: every wrapped fragment inherits the same raw source line, and selection range deduplicates line numbers.
+- Pretty Markdown can collapse multiple raw source lines into one rendered row. Mitigation: completed-message rendering now preserves raw source identity in selectable display-column spans, and wrapping clips/rebases those spans before anchor construction; the scalar row map remains only as a fallback for non-linear/specialized rows.
 - Persisted transcript identity may not currently expose one universal key. Mitigation: introduce a narrow replay identity from prompt index + role + ordinal and validate quote/context hashes.
 - Event routing changes touch central dispatch. Mitigation: explicit `Annotation` route variant and regression tests for Root/Child paths.
 - Terminal right-click portability varies. Mitigation: `Alt+A` is canonical; mouse is additive.
@@ -354,12 +393,14 @@ Manual smoke test in a standard TUI:
 
 - Planning: approved by the user on 2026-07-22.
 - Isolation (T1): complete.
-- Implementation: T2–T7 complete.
+- Implementation: T2–T8 complete; retained remediation review passed.
 - Main repository: `/Users/wanglidong/Repository/grok-build`, still checked out on pristine `main` at `ba76b0a`.
-- Implementation worktree: `/Users/wanglidong/Repository/grok-build-worktrees/inline-annotations`.
+- Delivered implementation worktree: removed after commit `4928862` was pushed.
+- Active remediation worktree: `/Users/wanglidong/Repository/grok-build-worktrees/inline-annotations-fixes`.
 - Branches:
   - base: `downstream/main` at `ba76b0a`;
-  - work: `feature/inline-annotations`.
+  - delivered feature: `feature/inline-annotations` at `4928862`;
+  - remediation: `fix/inline-annotations-review`, based on `feature/inline-annotations`.
 - Agent Deck tasks:
   - T1 `770e449c-8332-4967-9a2e-204c60cea06a` — isolate worktree;
   - T2 `eadf1639-fa6b-4190-a561-fcfe0ec69751` — semantic lines and anchors;
@@ -367,7 +408,8 @@ Manual smoke test in a standard TUI:
   - T4 `b05ed15c-e0ef-4b3b-8749-b1fdf997dfbc` — hidden no-tool forks;
   - T5 `2affc384-0421-4084-8f26-8a3c0cb18f5e` — session routing;
   - T6 `07bc7bd0-d4f5-4c3d-a753-c23684a1fd24` — standard TUI;
-  - T7 `2c986083-0c0d-42d8-bc09-a09b3fc809ee` — validation/docs.
+  - T7 `2c986083-0c0d-42d8-bc09-a09b3fc809ee` — validation/docs;
+  - T8 `497d1845-0061-47a3-a41f-4c74609cc696` — review remediation.
 - T2 completion (2026-07-22):
   - added 1-based raw source-line metadata to completed User/Assistant rows;
   - preserved Markdown source maps through wrapping and completion-time cache rebuilds;
@@ -407,4 +449,63 @@ Manual smoke test in a standard TUI:
   - `cargo test -p xai-grok-shell` completes with 5733 passed, 1 failed, and 13 ignored. The sole `claude_import::tests::gate_load_claude_env_returns_empty_when_marker_set` environment failure reproduces on pristine `main@ba76b0a`; all six new annotation safety tests pass;
   - PTY smoke checks launch and quit the standard TUI and `--minimal` successfully. Full live create/stream/follow-up/reload E2E was not sent because this environment stops at browser authentication; no model request or external mutation was made;
   - the primary repository remains clean on `main` at `ba76b0a683fa52e4e60685017b85905451be17bc`.
-- First next action after delivery: merge the pushed `feature/inline-annotations` branch into `downstream/main` when the downstream maintainer is ready; keep pristine `main` reserved for upstream synchronization.
+- T8 start (2026-07-22): an independent complete read-only review reported four HIGH, three MEDIUM, and one LOW finding; the user explicitly authorized fixing all eight. The isolated remediation worktree and branch above were created from `4928862`, with no change to pristine `main`.
+- T8 implementation and local validation (2026-07-22):
+  - added display-column source spans through completed Markdown rendering and wrapping, with wide/narrow formatted ASCII and CJK soft-break selection coverage;
+  - gated client and file hook dispatch through the annotation actor policy for `SessionStart`, both `SessionEnd` reasons, Stop, notification, and subagent-start paths;
+  - made root/annotation coexistence prompt-aware for ACP/xAI chunks, queue broadcasts, and prompt completion while retaining ordinary root ownership for ordinary prompts;
+  - made append failure drain and reconcile every queued/active thread, close unhealthy storage to new work, and cover multi-thread plus terminal-event failure;
+  - made Persisting/LoadingChild cancellation local and terminal, added exchange/phase guards to every continuation, and kept ACP cancel exclusive to Prompting;
+  - restored annotation logs for non-minimal chat-kind parents, cached card bodies by content/width/theme/expansion with bounded invalidation coverage, and surfaced concise load warning/error toasts;
+  - focused results: all 44 annotation pager regressions passed, all 472 `xai-grok-markdown` tests passed, and all 7 annotation shell policy tests passed;
+  - `cargo check -p xai-grok-pager-bin`, `cargo build -p xai-grok-pager-bin --bin xai-grok-pager`, `cargo fmt --all -- --check`, and `git diff --check` pass;
+  - `cargo test -p xai-grok-pager` completed with 7427 passed, 11 failed, and 10 ignored. The same six skill-token color, three cursor/theme, and two macOS `Opt+Enter` failures are the recorded pristine-main baseline; there are no new failures;
+  - `cargo test -p xai-grok-shell` completed with 5734 passed, 1 failed, and 13 ignored. The sole `claude_import::tests::gate_load_claude_env_returns_empty_when_marker_set` failure is the recorded pristine-main baseline;
+  - explicit PTY smoke tests passed for standard welcome-screen launch/quit and minimal-mode launch/double-Ctrl+C quit. No authenticated live model request or other external mutation was sent.
+- T8 retained-review round 1 (2026-07-22): the same read-only `gpt-5.6-sol`/`max` reviewer confirmed CODEX-001/005/006/007/008 fixed, but found four remaining issues: direct turn Stop/workspace-hook rails, durable terminal/retry coexistence routing, live prompt draining after append failure, and quadratic source-span wrapping.
+- T8 retained-review round 1 remediation (2026-07-22):
+  - `run_stop_gate` now fails open before consulting file/client hooks when actor policy disallows hooks, and both workspace before/after-turn helpers no-op at the same policy boundary; direct file/client Stop and workspace-spy tests include Standard-actor positive controls;
+  - durable `TurnCompleted` routing derives prompt identity from its payload before owner selection, live prompt-scoped xAI updates inherit `promptId`, and terminal emission explicitly preserves that id after the live prompt pin is cleared; coexistence coverage now includes legacy and durable terminals (live/replayed), annotation/root retry updates, and ordinary root completion;
+  - append failure now cancels every genuinely Prompting exchange, avoids duplicate cancellation for Cancelling exchanges, retains a prompt-ownership drain tombstone until the exact prompt terminal, ignores late chunks, and never lets that terminal overwrite the storage failure; multi-stream and coexisting-root tests cover the drain lifecycle;
+  - source-span wrapping now advances monotonic byte/display-column and semantic-span cursors, making ordinary long-line wrapping linear; a 4,096-soft-break scaling regression preserves every source line at width 1;
+  - post-remediation focused results pass: 46 pager annotation tests, 8 shell annotation/fork/policy tests, 9 durable turn-completion emission tests, the 4,096-span performance regression, formatting, and diff checks.
+- T8 retained-review round 1 full validation (2026-07-22):
+  - `cargo fmt --all -- --check`, `cargo check -p xai-grok-pager-bin`, and `git diff --check` pass;
+  - `cargo test -p xai-grok-pager` completes with 7430 passed, 11 failed, and 10 ignored. The 11 failures are the same recorded pristine-main baseline: six skill-token color expectations, three cursor/theme expectations, and two macOS `Opt+Enter` labels;
+  - the default concurrent shell run exposed an unchanged `test_pool_fill_creates_worktrees` cleanup race that left `git status` in a deleted temporary cwd; that exact test passed alone. A complete single-thread rerun then finished with 5736 passed, 1 failed, and 13 ignored, with only the already-recorded `claude_import::tests::gate_load_claude_env_returns_empty_when_marker_set` baseline failure;
+  - ignored PTY tests passed explicitly for the standard welcome-screen launch/quit and minimal-mode first/second Ctrl+C confirmation/quit paths;
+  - the primary repository remains clean on `main` at `ba76b0a683fa52e4e60685017b85905451be17bc`.
+- T8 retained-review round 2 (2026-07-22): the same reviewer confirmed the
+  original CODEX-001/002/004/005/006/007/008 findings and the source-span
+  performance follow-up fixed. CODEX-003 had one remaining MEDIUM regression:
+  the shared xAI sender attributed session-global broadcasts such as manual
+  recap and hook/plugin registry changes to an unrelated live annotation
+  prompt, so root-first coexistence routing could drop them.
+- T8 retained-review round 2 remediation (2026-07-22): xAI prompt attribution
+  is now an explicit allowlist for retry, automatic compact/continue/recovery,
+  and prompt image-processing updates; session-global broadcasts remain
+  unscoped, while payload-identified terminals retain their authoritative id.
+  Shell coverage distinguishes a prompt-scoped retry from an unscoped recap
+  terminal, and pager coexistence coverage verifies the ordinary child root
+  consumes the recap terminal without disturbing annotation prompt ownership.
+- T8 retained-review round 2 validation (2026-07-22): the focused shell
+  attribution test, the root/annotation recap coexistence regression, all 46
+  pager annotation tests, all 8 annotation fork/policy shell tests, and all 9
+  durable turn-completion tests pass. `cargo fmt --all -- --check`,
+  `cargo check -p xai-grok-pager-bin`, and `git diff --check` pass. Full pager
+  remains 7430 passed / 11 recorded baseline failures / 10 ignored; full
+  single-thread shell remains 5736 passed / the one recorded `claude_import`
+  baseline failure / 13 ignored. Explicit standard welcome-screen and minimal
+  double-Ctrl+C PTY smoke tests pass, and pristine `main` remains unchanged.
+- T8 retained-review round 3 (2026-07-22): the same retained read-only
+  `gpt-5.6-sol`/`max` reviewer completed another full-file and call-site audit,
+  reported no findings, confirmed every original CODEX-001 through CODEX-008
+  disposition plus both prior follow-up rounds fixed, and returned explicit
+  `REVIEW PASS`.
+- T8 delivery (2026-07-22): the reviewed remediation is committed and pushed
+  on `fix/inline-annotations-review`, `feature/inline-annotations` is
+  fast-forwarded and pushed to the same commit without force, both branches are
+  retained, the isolated remediation worktree is removed, and the primary
+  repository remains pristine on `main@ba76b0a`.
+- Current state: T8 is complete; no implementation, validation, review, or
+  delivery work remains.

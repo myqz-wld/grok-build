@@ -78,6 +78,15 @@ use xai_grok_tools::types::compat::CompatConfig;
 use xai_grok_tools::types::output::{
     BashOutput, ReadFileOutput, ToolOutput as ToolsToolOutput, ToolRunResult,
 };
+
+#[cfg(test)]
+thread_local! {
+    /// Direct call-boundary spy for the workspace turn-hook rail. Thread-local
+    /// storage keeps current-thread actor tests isolated from the parallel test
+    /// suite without adding test-only fields to every `SessionActor` literal.
+    static WORKSPACE_TURN_HOOK_TEST_CALLS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
 use xai_grok_workspace::file_system::CodebaseIndexManager;
 use xai_grok_workspace::permission::{
     AccessKind, ClientType, Decision, PermissionEvent, PermissionHandle,
@@ -1120,6 +1129,14 @@ impl SessionActor {
         &self,
         payload: xai_tool_protocol::turn_hook::BeforeTurnPayload,
     ) {
+        if !self.startup_hints.actor_policy.allows_hooks() {
+            return;
+        }
+        #[cfg(test)]
+        WORKSPACE_TURN_HOOK_TEST_CALLS.with(|calls| {
+            let (before, after) = calls.get();
+            calls.set((before.saturating_add(1), after));
+        });
         self.workspace_ops
             .on_before_turn(&self.session_id_string(), &payload)
             .await;
@@ -1127,9 +1144,27 @@ impl SessionActor {
     /// Send an after-turn hook via the local workspace channel.
     /// Fire-and-forget — failures are logged but do not interrupt the turn.
     async fn send_after_turn_event(&self, payload: xai_tool_protocol::turn_hook::AfterTurnPayload) {
+        if !self.startup_hints.actor_policy.allows_hooks() {
+            return;
+        }
+        #[cfg(test)]
+        WORKSPACE_TURN_HOOK_TEST_CALLS.with(|calls| {
+            let (before, after) = calls.get();
+            calls.set((before, after.saturating_add(1)));
+        });
         self.workspace_ops
             .on_after_turn(&self.session_id_string(), &payload)
             .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_workspace_turn_hook_test_calls() {
+        WORKSPACE_TURN_HOOK_TEST_CALLS.with(|calls| calls.set((0, 0)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_turn_hook_test_calls() -> (u64, u64) {
+        WORKSPACE_TURN_HOOK_TEST_CALLS.with(std::cell::Cell::get)
     }
     /// Compute the live command availability snapshot for this session.
     ///

@@ -611,6 +611,10 @@ impl SessionActorPolicy {
         matches!(self, Self::Standard)
     }
 
+    pub(crate) fn allows_hooks(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
     pub(crate) fn allows_backend_search(self) -> bool {
         matches!(self, Self::Standard)
     }

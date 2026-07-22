@@ -172,6 +172,11 @@ pub struct BlockLine {
     /// line carries the same value. Synthetic chrome and non-message blocks
     /// leave this as `None`.
     pub source_line: Option<usize>,
+    /// Display-column ranges carrying semantic source identity. Values are
+    /// 1-based in pager space. This refines `source_line` for rendered rows
+    /// that combine multiple raw Markdown lines (for example a collapsed soft
+    /// break); an empty vector means callers should use the scalar fallback.
+    pub source_spans: Vec<xai_grok_markdown::SourceLineSpan>,
     /// Semantic link target when paint text cannot recover it (tool headers).
     pub link_target: Option<crate::render::osc8::LinkTarget>,
 }
@@ -189,6 +194,7 @@ impl Default for BlockLine {
             selection_text: None,
             joiner: None,
             source_line: None,
+            source_spans: Vec::new(),
             link_target: None,
         }
     }
@@ -283,6 +289,15 @@ impl BlockLine {
     /// Set the 1-based raw-message source line represented by this row.
     pub fn with_source_line(mut self, source_line: Option<usize>) -> Self {
         self.source_line = source_line;
+        self
+    }
+
+    /// Set display-column source identity for a rendered row.
+    pub fn with_source_spans(
+        mut self,
+        source_spans: Vec<xai_grok_markdown::SourceLineSpan>,
+    ) -> Self {
+        self.source_spans = source_spans;
         self
     }
 }
@@ -618,6 +633,7 @@ mod tests {
             selection_text: None,
             joiner: None,
             source_line: None,
+            source_spans: Vec::new(),
             link_target: None,
         };
     }

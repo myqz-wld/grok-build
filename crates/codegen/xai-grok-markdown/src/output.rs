@@ -6,6 +6,18 @@ use ratatui::text::Line;
 
 use crate::buffers::CodeBlockMeta;
 
+/// A display-column range on one rendered row that originated from one raw
+/// Markdown source line.
+///
+/// The range is half-open and uses terminal display columns rather than bytes,
+/// so callers can resolve selections correctly for wide Unicode characters.
+/// `source_line` is zero-based while this value is inside the markdown crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLineSpan {
+    pub column_range: Range<usize>,
+    pub source_line: usize,
+}
+
 /// A hyperlink target extracted from rendered markdown.
 ///
 /// Each instance maps a contiguous cell range on one rendered line to a URL.
@@ -86,6 +98,12 @@ pub struct MarkdownRenderOutput {
     /// `line_source_map[rendered_line_idx]` = source line number (0-indexed).
     pub line_source_map: Vec<usize>,
 
+    /// Selectable-column source identity for every rendered row, parallel to
+    /// `lines`. Unlike `line_source_map`, this can represent a pretty-rendered
+    /// row that contains text from more than one raw line (for example, a
+    /// collapsed CommonMark soft break).
+    pub line_source_spans: Vec<Vec<SourceLineSpan>>,
+
     /// Maps a cell range on a rendered line to a URL. Links that
     /// wrap across lines produce multiple entries with the same `id` and `url`.
     pub hyperlinks: Vec<HyperlinkTarget>,
@@ -105,6 +123,7 @@ impl MarkdownRenderOutput {
     pub fn clear(&mut self) {
         self.lines.clear();
         self.line_source_map.clear();
+        self.line_source_spans.clear();
         self.hyperlinks.clear();
         self.code_blocks.clear();
     }
@@ -114,6 +133,7 @@ impl MarkdownRenderOutput {
         MarkdownRenderView {
             lines: &self.lines,
             line_source_map: &self.line_source_map,
+            line_source_spans: &self.line_source_spans,
             hyperlinks: &self.hyperlinks,
             code_blocks: &self.code_blocks,
         }
@@ -131,6 +151,9 @@ pub struct MarkdownRenderView<'a> {
 
     /// Maps each rendered line index to its source line number.
     pub line_source_map: &'a [usize],
+
+    /// Per-row display-column source spans, parallel to `lines`.
+    pub line_source_spans: &'a [Vec<SourceLineSpan>],
 
     /// Hyperlink targets extracted from the rendered markdown.
     pub hyperlinks: &'a [HyperlinkTarget],

@@ -1,6 +1,6 @@
 //! Standard-TUI overlays and transient interaction state for inline annotations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -102,6 +102,19 @@ pub(crate) enum AnnotationCardAction {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnnotationCardBodyCacheKey {
+    pub(crate) content_revision: u64,
+    pub(crate) width: u16,
+    pub(crate) theme_revision: u64,
+    pub(crate) expanded: bool,
+}
+
+pub(crate) struct AnnotationCardBodyCache {
+    pub(crate) key: AnnotationCardBodyCacheKey,
+    pub(crate) lines: Vec<Line<'static>>,
+}
+
 impl AnnotationCardAction {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -136,6 +149,9 @@ pub(crate) struct AnnotationUiState {
     pub(crate) expanded_threads: HashSet<ThreadId>,
     pub(crate) card_placements: Vec<DecorationPlacement>,
     pub(crate) hovered_card_button: Option<(String, String)>,
+    pub(crate) thread_card_bodies: HashMap<ThreadId, AnnotationCardBodyCache>,
+    /// Cheap instrumentation used by cache regression tests and diagnostics.
+    pub(crate) card_body_cache_misses: u64,
 }
 
 pub(crate) fn render_annotation_composer(

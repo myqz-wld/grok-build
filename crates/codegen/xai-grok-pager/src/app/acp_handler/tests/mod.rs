@@ -1182,6 +1182,31 @@ pub(super) fn make_ext_session_notification(
         update,
     )
 }
+/// Build an xAI session update carrying explicit prompt attribution. This is
+/// the coexistence shape emitted while an annotation child is also open as an
+/// ordinary root view.
+pub(super) fn make_ext_session_notification_with_prompt(
+    session_id: &str,
+    update: XaiSessionUpdate,
+    prompt_id: &str,
+    is_replay: bool,
+) -> AcpClientMessage {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let payload = SessionNotification {
+        session_id: acp::SessionId::new(session_id),
+        update,
+        meta: Some(serde_json::json!({
+            "promptId": prompt_id,
+            "isReplay": is_replay,
+        })),
+    };
+    let raw = serde_json::value::to_raw_value(&payload).unwrap();
+    let request = acp::ExtNotification::new("x.ai/session_notification", raw.into());
+    AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+        request,
+        response_tx: tx,
+    })
+}
 /// Build an `ExtNotification` envelope with an explicit xAI session method.
 pub(super) fn make_ext_session_notification_with_method(
     session_id: &str,

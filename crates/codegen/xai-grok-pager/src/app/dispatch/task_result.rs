@@ -341,14 +341,23 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::AnnotationSessionLoaded {
             agent_id,
             thread_id,
+            exchange_id,
             session_id,
-        } => handle_annotation_session_loaded(app, agent_id, thread_id, session_id),
+        } => handle_annotation_session_loaded(app, agent_id, thread_id, exchange_id, session_id),
         TaskResult::AnnotationSessionLoadFailed {
             agent_id,
             thread_id,
+            exchange_id,
             session_id,
             error,
-        } => handle_annotation_session_load_failed(app, agent_id, thread_id, session_id, error),
+        } => handle_annotation_session_load_failed(
+            app,
+            agent_id,
+            thread_id,
+            exchange_id,
+            session_id,
+            error,
+        ),
         TaskResult::AnnotationPromptFinished {
             agent_id,
             thread_id,

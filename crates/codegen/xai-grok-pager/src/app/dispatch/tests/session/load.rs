@@ -98,6 +98,39 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
         "SessionLoaded must store restore_degree on the session"
     );
 }
+
+#[test]
+fn standard_tui_chat_session_restores_persisted_annotations() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("chat-with-annotations".into(), None, true),
+        &mut app,
+    );
+    let id = AgentId(0);
+
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::SessionLoaded {
+            agent_id: id,
+            session_id: acp::SessionId::new("chat-with-annotations"),
+            models: None,
+            code_restored: false,
+            restore_summary: None,
+            restore_degree: None,
+            running_prompt_id: None,
+        }),
+        &mut app,
+    );
+
+    assert!(app.agents[&id].chat_kind);
+    assert!(app.agents[&id].annotation_runtime.restoring);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::LoadAnnotationState {
+            agent_id,
+            parent_session_id,
+        } if *agent_id == id && parent_session_id == "chat-with-annotations"
+    )));
+}
 /// Title hydration for an auto-generated title keeps today's behavior:
 /// only `generated_session_title` is set, never `display_name` (no
 /// border title).

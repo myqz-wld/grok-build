@@ -1423,6 +1423,7 @@ pub enum Effect {
     LoadAnnotationSession {
         agent_id: AgentId,
         thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
         session_id: acp::SessionId,
         cwd: std::path::PathBuf,
     },
@@ -2228,11 +2229,13 @@ pub enum TaskResult {
     AnnotationSessionLoaded {
         agent_id: AgentId,
         thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
         session_id: acp::SessionId,
     },
     AnnotationSessionLoadFailed {
         agent_id: AgentId,
         thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
         session_id: acp::SessionId,
         error: String,
     },

@@ -14,6 +14,37 @@ fn active_root_agent_id(app: &AppView) -> Option<AgentId> {
     }
 }
 
+fn annotation_warning_detail(warning: &AnnotationWarning) -> String {
+    match warning {
+        AnnotationWarning::IncompleteTail { line } => {
+            format!("incomplete final record at line {line}")
+        }
+        AnnotationWarning::MalformedLine { line, .. } => {
+            format!("malformed record at line {line}")
+        }
+        AnnotationWarning::UnsupportedSchema {
+            line,
+            schema_version,
+        } => format!("unsupported schema {schema_version} at line {line}"),
+        AnnotationWarning::DuplicateEvent { event_id } => {
+            format!("duplicate event {event_id}")
+        }
+        AnnotationWarning::InvalidSequence { event_id, .. } => {
+            format!("invalid event order near {event_id}")
+        }
+    }
+}
+
+fn annotation_warning_toast(warnings: &[AnnotationWarning]) -> Option<String> {
+    let first = warnings.first()?;
+    let count = warnings.len();
+    let noun = if count == 1 { "warning" } else { "warnings" };
+    Some(format!(
+        "Annotations recovered with {count} {noun}: {}",
+        annotation_warning_detail(first)
+    ))
+}
+
 pub(super) fn dispatch_begin_inline_annotation(
     app: &mut AppView,
     anchor: crate::annotations::AnnotationAnchor,
@@ -74,7 +105,7 @@ pub(super) fn dispatch_cancel_inline_annotation(
         return Vec::new();
     };
     match agent.cancel_annotation(agent_id, thread_id) {
-        Ok(effect) => vec![effect],
+        Ok(effects) => effects,
         Err(message) => {
             agent.show_toast(&message);
             Vec::new()
@@ -129,7 +160,11 @@ pub(super) fn handle_annotation_state_loaded(
         |key| resolve_transcript_key(&agent.scrollback, key),
         |child_session_id| existing_child_sessions.contains(child_session_id),
     );
+    let warning_toast = annotation_warning_toast(&warnings);
     agent.annotation_runtime.restore(state, warnings);
+    if let Some(message) = warning_toast {
+        agent.show_toast(&message);
+    }
     Vec::new()
 }
 
@@ -153,7 +188,8 @@ pub(super) fn handle_annotation_state_load_failed(
         return Vec::new();
     }
     agent.annotation_runtime.restoring = false;
-    agent.annotation_runtime.last_error = Some(error);
+    agent.annotation_runtime.last_error = Some(error.clone());
+    agent.show_toast(&format!("Couldn't load annotations: {error}"));
     Vec::new()
 }
 
@@ -202,21 +238,22 @@ pub(super) fn handle_annotation_event_persist_failed(
     event_id: uuid::Uuid,
     error: String,
 ) -> Vec<Effect> {
-    if let Some(agent) = app.agents.get_mut(&agent_id) {
-        agent.annotation_persist_failed(event_id, error);
-    }
-    Vec::new()
+    app.agents
+        .get_mut(&agent_id)
+        .map(|agent| agent.annotation_persist_failed(agent_id, event_id, error))
+        .unwrap_or_default()
 }
 
 pub(super) fn handle_annotation_session_loaded(
     app: &mut AppView,
     agent_id: AgentId,
     thread_id: ThreadId,
+    exchange_id: ExchangeId,
     session_id: acp::SessionId,
 ) -> Vec<Effect> {
     app.agents
         .get_mut(&agent_id)
-        .map(|agent| agent.annotation_session_loaded(agent_id, thread_id, &session_id))
+        .map(|agent| agent.annotation_session_loaded(agent_id, thread_id, exchange_id, &session_id))
         .unwrap_or_default()
 }
 
@@ -224,12 +261,21 @@ pub(super) fn handle_annotation_session_load_failed(
     app: &mut AppView,
     agent_id: AgentId,
     thread_id: ThreadId,
+    exchange_id: ExchangeId,
     session_id: acp::SessionId,
     error: String,
 ) -> Vec<Effect> {
     app.agents
         .get_mut(&agent_id)
-        .map(|agent| agent.annotation_session_load_failed(agent_id, thread_id, &session_id, error))
+        .map(|agent| {
+            agent.annotation_session_load_failed(
+                agent_id,
+                thread_id,
+                exchange_id,
+                &session_id,
+                error,
+            )
+        })
         .unwrap_or_default()
 }
 

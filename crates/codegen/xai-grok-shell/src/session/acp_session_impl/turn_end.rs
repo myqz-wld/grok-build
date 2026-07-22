@@ -322,11 +322,15 @@ impl SessionActor {
         cancel_trigger: Option<&str>,
     ) {
         let (stop_reason, agent_result) = crate::sampling::error::prompt_complete_fields(mapped);
-        let extra_meta = cancel_trigger.map(|t| {
-            [("cancelTrigger".to_string(), serde_json::json!(t))]
-                .into_iter()
-                .collect()
-        });
+        // `handle_completion` deliberately clears `current_prompt_id` before
+        // emitting this durable terminal. Stamp the payload's authoritative
+        // identity explicitly so both live routing and later replay remain
+        // unambiguous when the same session is also open as a root view.
+        let mut extra_meta =
+            serde_json::Map::from_iter([("promptId".to_string(), serde_json::json!(prompt_id))]);
+        if let Some(trigger) = cancel_trigger {
+            extra_meta.insert("cancelTrigger".into(), serde_json::json!(trigger));
+        }
         self.send_xai_notification_with_extra_meta(
             crate::session::turn_completion::build_turn_completed(
                 prompt_id,
@@ -334,7 +338,7 @@ impl SessionActor {
                 agent_result,
                 usage,
             ),
-            extra_meta,
+            Some(extra_meta),
         )
         .await;
     }

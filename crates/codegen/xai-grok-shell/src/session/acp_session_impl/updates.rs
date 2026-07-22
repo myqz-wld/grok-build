@@ -11,6 +11,28 @@ pub(super) enum SubagentUsageApply {
     /// Sticky report only — do not stain ledgers for "missing" spend.
     SessionOnly,
 }
+
+/// Whether an xAI update without its own prompt identity belongs to the live
+/// turn. Keep this as an explicit allowlist: session-global broadcasts (recap,
+/// hook/plugin registry changes, model state, memory, tasks, and goals) must
+/// remain session-scoped so a coexisting root view receives them even while an
+/// annotation prompt is running.
+fn xai_update_inherits_current_prompt_id(update: &XaiSessionUpdate) -> bool {
+    matches!(
+        update,
+        XaiSessionUpdate::RetryState(_)
+            | XaiSessionUpdate::AutoCompactStarted { .. }
+            | XaiSessionUpdate::AutoCompactCompleted { .. }
+            | XaiSessionUpdate::AutoCompactFailed { .. }
+            | XaiSessionUpdate::AutoCompactCancelled { .. }
+            | XaiSessionUpdate::AutoContinueCompleted { .. }
+            | XaiSessionUpdate::AutoRecoveryStarted { .. }
+            | XaiSessionUpdate::AutoRecoveryExhausted { .. }
+            | XaiSessionUpdate::ImageCompressed { .. }
+            | XaiSessionUpdate::ImageDropped { .. }
+    )
+}
+
 impl SessionActor {
     /// Apply subagent usage. `Ok` after chat-state acked; `Err` if apply failed.
     pub(super) async fn record_subagent_usage(
@@ -469,25 +491,27 @@ impl SessionActor {
                         finished_marginal,
                     );
                 }
-                let envelope = self.fire_hook(
-                    xai_grok_hooks::event::HookEventName::SubagentStart,
-                    None,
-                    xai_grok_hooks::event::HookPayload::SubagentStart {
-                        subagent_id: subagent_id.clone(),
-                        subagent_type: subagent_type.clone(),
-                        description: Some(description.clone()),
-                    },
-                );
-                let hook_registry_snapshot = self.hook_registry.borrow().clone();
-                if let Some(registry) = hook_registry_snapshot {
-                    let ctx = self.hook_run_ctx();
-                    let _ = xai_grok_hooks::dispatcher::dispatch_non_blocking(
-                        &registry,
+                if self.startup_hints.actor_policy.allows_hooks() {
+                    let envelope = self.fire_hook(
                         xai_grok_hooks::event::HookEventName::SubagentStart,
-                        &envelope,
-                        &ctx,
-                    )
-                    .await;
+                        None,
+                        xai_grok_hooks::event::HookPayload::SubagentStart {
+                            subagent_id: subagent_id.clone(),
+                            subagent_type: subagent_type.clone(),
+                            description: Some(description.clone()),
+                        },
+                    );
+                    let hook_registry_snapshot = self.hook_registry.borrow().clone();
+                    if let Some(registry) = hook_registry_snapshot {
+                        let ctx = self.hook_run_ctx();
+                        let _ = xai_grok_hooks::dispatcher::dispatch_non_blocking(
+                            &registry,
+                            xai_grok_hooks::event::HookEventName::SubagentStart,
+                            &envelope,
+                            &ctx,
+                        )
+                        .await;
+                    }
                 }
             }
             XaiSessionUpdate::SubagentFinished {
@@ -628,6 +652,9 @@ impl SessionActor {
         title: Option<String>,
         level: Option<String>,
     ) {
+        if !self.startup_hints.actor_policy.allows_hooks() {
+            return;
+        }
         let envelope = self.fire_hook(
             xai_grok_hooks::event::HookEventName::Notification,
             None,
@@ -670,6 +697,16 @@ impl SessionActor {
             let mut meta = self.build_notification_meta();
             if let (Some(obj), Some(extra)) = (meta.as_object_mut(), extra_meta) {
                 obj.extend(extra);
+            }
+            if xai_update_inherits_current_prompt_id(&update)
+                && let Some(obj) = meta.as_object_mut()
+                && !obj.contains_key("promptId")
+                && let Some(prompt_id) = self.current_prompt_id.lock().ok().and_then(|g| g.clone())
+            {
+                // Match ACP session/update attribution for the deliberately
+                // classified prompt-scoped xAI events above. Payload-scoped
+                // updates such as TurnCompleted carry their own identity.
+                obj.insert("promptId".into(), prompt_id.into());
             }
             meta
         };

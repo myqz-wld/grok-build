@@ -727,6 +727,7 @@ pub(crate) fn execute(
         Effect::LoadAnnotationSession {
             agent_id,
             thread_id,
+            exchange_id,
             session_id,
             cwd,
         } => {
@@ -742,11 +743,13 @@ pub(crate) fn execute(
                     Ok(_) => TaskResult::AnnotationSessionLoaded {
                         agent_id,
                         thread_id,
+                        exchange_id,
                         session_id,
                     },
                     Err(error) => TaskResult::AnnotationSessionLoadFailed {
                         agent_id,
                         thread_id,
+                        exchange_id,
                         session_id,
                         error: sanitize_user_error(&error.to_string()),
                     },

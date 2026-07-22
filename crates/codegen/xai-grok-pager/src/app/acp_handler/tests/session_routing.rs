@@ -163,6 +163,261 @@
     }
 
     #[test]
+    fn open_annotation_child_routes_by_running_prompt_without_stealing_root_prompts() {
+        let mut app = make_app_with_agent("parent");
+        let thread_id = uuid::Uuid::from_u128(110);
+        let exchange_id = uuid::Uuid::from_u128(111);
+        let selected = "selected";
+        let anchor = crate::annotations::AnnotationAnchor {
+            parent_session_id: "parent".into(),
+            transcript_key: crate::annotations::TranscriptKey {
+                prompt_index: 0,
+                role: crate::annotations::AnnotationEntryRole::Assistant,
+                ordinal: 0,
+            },
+            entry_role: crate::annotations::AnnotationEntryRole::Assistant,
+            target_prompt_index: 0,
+            start_source_line: 1,
+            end_source_line: 1,
+            selected_text: selected.into(),
+            selected_text_hash: blake3::hash(selected.as_bytes()).to_hex().to_string(),
+            surrounding_text_hash: blake3::hash(selected.as_bytes()).to_hex().to_string(),
+        };
+        let annotation_prompt_id;
+        {
+            let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+            assert!(parent.annotation_runtime.state.apply(
+                crate::annotations::AnnotationEvent::new(
+                    thread_id,
+                    crate::annotations::AnnotationEventKind::ThreadCreated {
+                        anchor,
+                        child_session_id: "annotation-child".into(),
+                        first_question: "why?".into(),
+                    },
+                ),
+            ).is_none());
+            assert!(parent.annotation_runtime.state.apply(
+                crate::annotations::AnnotationEvent::new(
+                    thread_id,
+                    crate::annotations::AnnotationEventKind::ExchangeStarted {
+                        exchange_id,
+                        question: "why?".into(),
+                    },
+                ),
+            ).is_none());
+            parent.annotation_runtime.sessions.insert("annotation-child".into(), thread_id);
+            let in_flight = crate::annotations::AnnotationInFlight::new(
+                exchange_id,
+                "why?".into(),
+                crate::annotations::AnnotationExchangePhase::Prompting,
+            );
+            annotation_prompt_id = in_flight.prompt_id.clone();
+            parent.annotation_runtime.in_flight.insert(thread_id, in_flight);
+        }
+
+        // Simulate the card's Open child action creating an ordinary root view
+        // for the very same session while the parent card remains usable.
+        insert_agent(&mut app, AgentId(1), Some("annotation-child"));
+
+        assert!(matches!(
+            find_session_match(&app, &acp::SessionId::new("annotation-child")),
+            Some(SessionMatch::Root(AgentId(1)))
+        ));
+        assert!(matches!(
+            find_session_match_for_prompt(
+                &app,
+                &acp::SessionId::new("annotation-child"),
+                Some(&annotation_prompt_id),
+            ),
+            Some(SessionMatch::Annotation { agent_id: AgentId(0), thread_id: id }) if id == thread_id
+        ));
+
+        let affected = handle(
+            make_agent_chunk_message_with_prompt(
+                "annotation-child",
+                "annotation follow-up",
+                &annotation_prompt_id,
+                false,
+            ),
+            &mut app,
+        );
+        assert!(affected, "returning to the visible parent redraws the card");
+        assert_eq!(
+            app.agents[&AgentId(0)].annotation_runtime.state.threads[&thread_id].exchanges[0]
+                .answer_markdown,
+            "annotation follow-up"
+        );
+        assert!(app.agents[&AgentId(1)].scrollback.is_empty());
+
+        handle(
+            make_agent_chunk_message_with_prompt(
+                "annotation-child",
+                "ordinary root answer",
+                "root-prompt",
+                false,
+            ),
+            &mut app,
+        );
+        assert_eq!(agent_message_text(&app.agents[&AgentId(1)]), "ordinary root answer");
+        assert_eq!(
+            app.agents[&AgentId(0)].annotation_runtime.state.threads[&thread_id].exchanges[0]
+                .answer_markdown,
+            "annotation follow-up",
+            "the open root's own prompt must not leak into the card"
+        );
+
+        {
+            let root = app.agents.get_mut(&AgentId(1)).unwrap();
+            root.attached_as_viewer = true;
+            root.session.state = AgentState::TurnRunning;
+            root.session.current_prompt_id = Some("root-prompt".into());
+        }
+        assert!(!handle_prompt_complete(
+            &prompt_complete_ext_with_prompt_id(
+                "annotation-child",
+                &annotation_prompt_id,
+                "end_turn",
+            ),
+            &mut app,
+        ));
+        let root = &app.agents[&AgentId(1)];
+        assert!(matches!(root.session.state, AgentState::TurnRunning));
+        assert_eq!(root.session.current_prompt_id.as_deref(), Some("root-prompt"));
+
+        for is_replay in [false, true] {
+            assert!(!handle_ext_notification(
+                &xai_turn_completed_notif(
+                    "annotation-child",
+                    &annotation_prompt_id,
+                    "end_turn",
+                    is_replay,
+                ),
+                &mut app,
+            ));
+            let root = &app.agents[&AgentId(1)];
+            assert!(matches!(root.session.state, AgentState::TurnRunning));
+            assert_eq!(
+                root.session.current_prompt_id.as_deref(),
+                Some("root-prompt"),
+                "live and replayed durable annotation terminals must not finish the root"
+            );
+        }
+
+        assert!(!handle(
+            make_ext_session_notification_with_prompt(
+                "annotation-child",
+                XaiSessionUpdate::RetryState(RetryState::Retrying {
+                    attempt: 1,
+                    max_retries: 3,
+                    reason: "annotation retry".into(),
+                }),
+                &annotation_prompt_id,
+                false,
+            ),
+            &mut app,
+        ));
+        assert!(
+            !matches!(
+                app.agents[&AgentId(1)].session.turn_activity(),
+                Some(crate::acp::tracker::TurnActivity::Retrying { reason, .. })
+                    if reason == "annotation retry"
+            ),
+            "annotation retry lifecycle must not decorate the coexisting root"
+        );
+
+        assert!(!handle(
+            make_ext_session_notification_with_prompt(
+                "annotation-child",
+                XaiSessionUpdate::RetryState(RetryState::Retrying {
+                    attempt: 1,
+                    max_retries: 3,
+                    reason: "root retry".into(),
+                }),
+                "root-prompt",
+                false,
+            ),
+            &mut app,
+        ));
+        assert!(matches!(
+            app.agents[&AgentId(1)].session.turn_activity(),
+            Some(crate::acp::tracker::TurnActivity::Retrying { reason, .. })
+                if reason == "root retry"
+        ));
+
+        // Session-global notifications deliberately carry no prompt id. Even
+        // with an annotation prompt in flight, root-first routing must let the
+        // ordinary child view consume its manual-recap terminal.
+        {
+            let root = app.agents.get_mut(&AgentId(1)).unwrap();
+            let spinner = root
+                .scrollback
+                .push(crate::scrollback::entry::ScrollbackEntry::running(
+                    recap_block(""),
+                ));
+            root.pending_recap_entry = Some(spinner);
+        }
+        assert!(!handle(
+            make_ext_session_notification(
+                "annotation-child",
+                XaiSessionUpdate::SessionRecapUnavailable,
+            ),
+            &mut app,
+        ));
+        assert!(
+            app.agents[&AgentId(1)].pending_recap_entry.is_none(),
+            "the coexisting root must consume the unscoped recap terminal"
+        );
+        assert_eq!(
+            app.agents[&AgentId(0)].annotation_runtime.in_flight[&thread_id].prompt_id,
+            annotation_prompt_id,
+            "session-global routing must leave annotation prompt ownership intact"
+        );
+
+        // A storage-failure drain retains prompt ownership even though the
+        // card is already locally failed and no longer accepts answer chunks.
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .annotation_runtime
+            .in_flight
+            .get_mut(&thread_id)
+            .unwrap()
+            .phase = crate::annotations::AnnotationExchangePhase::DrainingAfterStorageFailure;
+        assert!(!handle(
+            make_agent_chunk_message_with_prompt(
+                "annotation-child",
+                "must be discarded",
+                &annotation_prompt_id,
+                false,
+            ),
+            &mut app,
+        ));
+        assert_eq!(
+            agent_message_text(&app.agents[&AgentId(1)]),
+            "ordinary root answer",
+            "late drain chunks stay owned by the annotation and never reach the root"
+        );
+        assert_eq!(
+            app.agents[&AgentId(0)].annotation_runtime.state.threads[&thread_id].exchanges[0]
+                .answer_markdown,
+            "annotation follow-up"
+        );
+
+        assert!(!handle_ext_notification(
+            &xai_turn_completed_notif(
+                "annotation-child",
+                "root-prompt",
+                "end_turn",
+                false,
+            ),
+            &mut app,
+        ));
+        let root = &app.agents[&AgentId(1)];
+        assert!(matches!(root.session.state, AgentState::Idle));
+        assert!(root.session.current_prompt_id.is_none());
+    }
+
+    #[test]
     fn acp_chunk_with_unknown_session_id_is_dropped_and_no_redraw() {
         // No agent owns the session_id and the active agent already has a
         // session_id assigned (so the race-window fallback does not fire).

@@ -141,31 +141,70 @@ pub(super) fn find_session_match(
     app: &AppView,
     session_id: &acp::SessionId,
 ) -> Option<SessionMatch> {
-    // Single pass over `app.agents`: prefer an exact root match (returned
-    // immediately, since root takes precedence) but track the first child
-    // match seen as a fallback used after the full scan completes.
+    find_session_match_for_prompt(app, session_id, None)
+}
+
+/// Locate the owner of a prompt-attributed notification.
+///
+/// An annotation child may also be open as an ordinary root view. In that
+/// coexistence state the session id alone is ambiguous: notifications for the
+/// annotation prompt still belong to the parent-owned card, while prompts
+/// started from the open root belong to that root view. A prompt id matching
+/// the annotation thread's current in-flight prompt therefore takes precedence
+/// over the otherwise-normal exact-root match. Notifications without a prompt
+/// id retain the legacy root-first ownership order.
+pub(super) fn find_session_match_for_prompt(
+    app: &AppView,
+    session_id: &acp::SessionId,
+    prompt_id: Option<&str>,
+) -> Option<SessionMatch> {
+    // Single pass over `app.agents`: collect the exact root and fallback child
+    // owners while checking whether prompt attribution disambiguates an
+    // annotation owner before the usual root-first ordering is applied.
     //
     // Comparing `Option<&SessionId>` to `Some(&session_id)` borrows both
     // sides -- no SessionId clone. The HashMap lookup uses the inner `&str`
     // directly via the `Borrow<str>` impl on `String`, so no allocation
-    // either. This preserves the previous two-pass semantics (root wins
-    // when both could match) while halving the iteration cost on the hot
-    // notification path.
+    // either. Without an annotation prompt match this preserves the previous
+    // two-pass semantics (root wins when both could match) while halving the
+    // iteration cost on the hot notification path.
     let child_key: &str = session_id.0.as_ref();
+    let mut root_match: Option<AgentId> = None;
     let mut child_match: Option<AgentId> = None;
     let mut annotation_match: Option<(AgentId, crate::annotations::ThreadId)> = None;
+    let mut annotation_prompt_match: Option<(AgentId, crate::annotations::ThreadId)> = None;
     for (id, agent) in &app.agents {
-        if agent.session.session_id.as_ref() == Some(session_id) {
-            return Some(SessionMatch::Root(*id));
+        if root_match.is_none() && agent.session.session_id.as_ref() == Some(session_id) {
+            root_match = Some(*id);
         }
         if child_match.is_none() && agent.subagent_views.contains_key(child_key) {
             child_match = Some(*id);
         }
-        if annotation_match.is_none()
-            && let Some(thread_id) = agent.annotation_runtime.sessions.get(child_key)
-        {
-            annotation_match = Some((*id, *thread_id));
+        if let Some(thread_id) = agent.annotation_runtime.sessions.get(child_key) {
+            if annotation_match.is_none() {
+                annotation_match = Some((*id, *thread_id));
+            }
+            if annotation_prompt_match.is_none()
+                && prompt_id.is_some_and(|prompt_id| {
+                    agent
+                        .annotation_runtime
+                        .in_flight
+                        .get(thread_id)
+                        .is_some_and(|in_flight| in_flight.prompt_id == prompt_id)
+                })
+            {
+                annotation_prompt_match = Some((*id, *thread_id));
+            }
         }
+    }
+    if let Some((agent_id, thread_id)) = annotation_prompt_match {
+        return Some(SessionMatch::Annotation {
+            agent_id,
+            thread_id,
+        });
+    }
+    if let Some(id) = root_match {
+        return Some(SessionMatch::Root(id));
     }
     if let Some(id) = child_match {
         return Some(SessionMatch::Child(id));
