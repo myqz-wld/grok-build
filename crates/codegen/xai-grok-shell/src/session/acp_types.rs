@@ -586,9 +586,58 @@ pub struct FeedbackContext {
 
 // ── Startup hints ───────────────────────────────────────────────────────
 
+/// Runtime capabilities assigned to a session actor.
+///
+/// This value is deliberately not deserializable from ACP startup metadata.
+/// Callers derive it from the persisted session summary so a client cannot
+/// relax an annotation child's safety boundary on resume.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SessionActorPolicy {
+    #[default]
+    Standard,
+    Annotation,
+}
+
+impl SessionActorPolicy {
+    pub(crate) fn from_session_kind(session_kind: Option<&str>) -> Self {
+        if session_kind == Some("annotation") {
+            Self::Annotation
+        } else {
+            Self::Standard
+        }
+    }
+
+    pub(crate) fn allows_tools(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn allows_backend_search(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn allows_memory(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn allows_structured_output(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn filter_json_schema<T>(self, schema: Option<T>) -> Option<T> {
+        self.allows_structured_output().then_some(schema).flatten()
+    }
+
+    pub(crate) fn allows_mcp_reminders(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupHints {
+    /// Server-derived actor policy. Never accepted from client metadata.
+    #[serde(skip)]
+    pub(crate) actor_policy: SessionActorPolicy,
     #[serde(default)]
     pub non_interactive: bool,
     #[serde(default)]

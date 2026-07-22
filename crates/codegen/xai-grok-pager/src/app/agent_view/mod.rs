@@ -148,6 +148,8 @@ use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
+mod annotation_ui;
+mod annotations;
 mod cta;
 mod input;
 mod interactions;
@@ -1314,6 +1316,11 @@ pub struct AgentView {
     /// Child subagent views. Keyed by child_session_id.
     /// Created eagerly on SubagentSpawned so updates are tracked from the start.
     pub subagent_views: HashMap<String, Box<AgentView>>,
+    /// Parent-owned state for hidden inline-annotation children. These
+    /// sessions never become dashboard agents or ordinary child views.
+    pub(crate) annotation_runtime: crate::annotations::AnnotationRuntime,
+    /// Standard-TUI-only composer, context menu, card expansion, and hit state.
+    pub(crate) annotation_ui: crate::views::annotation::AnnotationUiState,
     /// Currently open subagent view (child_session_id). When Some, the
     /// scrollback area is replaced by the subagent's framed view.
     pub active_subagent: Option<String>,
@@ -2005,6 +2012,7 @@ fn resolve_action(action_id: Option<ActionId>) -> Option<InputOutcome> {
         ActionId::DumpInputLog => return None,
         ActionId::ToggleYolo => return None,
         ActionId::ToggleMultiline => return None,
+        ActionId::AnnotateSelection => return None,
         ActionId::InterjectPrompt => return None,
         ActionId::EnableVoiceMode => Action::EnableVoiceMode,
         ActionId::VoiceToggle => Action::VoiceToggle,

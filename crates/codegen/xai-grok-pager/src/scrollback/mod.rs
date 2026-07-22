@@ -13,6 +13,7 @@
 
 pub mod block;
 pub mod blocks;
+pub mod decorations;
 pub mod entry;
 pub mod export;
 pub mod layout;
@@ -32,6 +33,9 @@ pub mod wrappers;
 pub use block::{BlockContent, RenderBlock};
 pub use blocks::{
     AgentMessageBlock, SystemMessageBlock, ThinkingBlock, ToolCallBlock, UserPromptBlock,
+};
+pub use decorations::{
+    DecorationButton, DecorationLine, DecorationPlacement, ScrollbackDecoration,
 };
 pub use entry::{EntryId, ScrollbackEntry};
 pub use layout::HorizontalLayout;

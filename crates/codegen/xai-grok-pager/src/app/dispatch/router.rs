@@ -1,4 +1,8 @@
 //! Top-level action router: maps actions and action results to handlers.
+use super::annotations::{
+    dispatch_begin_inline_annotation, dispatch_cancel_inline_annotation,
+    dispatch_delete_inline_annotation, dispatch_follow_up_inline_annotation,
+};
 use super::auth::{
     dispatch_cancel_login, dispatch_login, dispatch_logout, dispatch_submit_auth_code,
     dispatch_switch_account,
@@ -208,6 +212,19 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::DismissClaudeImport => dispatch_dismiss_claude_import(app),
         Action::LoadSession(session_id, session_cwd, chat_kind) => {
             dispatch_load_session(app, session_id, session_cwd, chat_kind)
+        }
+        Action::BeginInlineAnnotation { anchor, question } => {
+            dispatch_begin_inline_annotation(app, anchor, question)
+        }
+        Action::FollowUpInlineAnnotation {
+            thread_id,
+            question,
+        } => dispatch_follow_up_inline_annotation(app, thread_id, question),
+        Action::CancelInlineAnnotation(thread_id) => {
+            dispatch_cancel_inline_annotation(app, thread_id)
+        }
+        Action::DeleteInlineAnnotation(thread_id) => {
+            dispatch_delete_inline_annotation(app, thread_id)
         }
         Action::NewSessionWithId(session_id) => dispatch_new_session_with_id(app, session_id),
         Action::StartupForkSession {

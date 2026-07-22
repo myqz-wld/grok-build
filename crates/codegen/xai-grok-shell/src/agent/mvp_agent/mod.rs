@@ -214,6 +214,9 @@ pub(crate) struct SessionSpawnOptions<'a> {
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub prompt_display_cwd: Option<String>,
+    /// Derived from the persisted summary for resumed sessions. Clients cannot
+    /// override this through request metadata.
+    pub actor_policy: crate::session::SessionActorPolicy,
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -350,6 +353,7 @@ pub(crate) fn chat_session_spawn_options<'a>(
         session_yolo_mode,
         session_auto_mode: false,
         prompt_display_cwd: None,
+        actor_policy: crate::session::SessionActorPolicy::Standard,
     }
 }
 /// `_meta.noReplay` → skip gateway replay (client already has the transcript).

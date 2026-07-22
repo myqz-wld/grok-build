@@ -11,7 +11,7 @@ use crate::render::color::{blend_color, fade_region};
 use crate::scrollback::block::{BlockContent, RenderBlock};
 use crate::scrollback::entry::ScrollbackEntry;
 use crate::scrollback::layout::HorizontalLayout;
-use crate::scrollback::render::{ScratchBuffer, render_scrolled_entries_with_selection_boundaries};
+use crate::scrollback::render::{ScratchBuffer, render_scrolled_entries_with_decorations};
 use crate::scrollback::selection::{RenderOutput, ScrollInfo, SelectionBox};
 use crate::scrollback::state::{ScrollbackState, ViewMode};
 use crate::scrollback::sticky::{PromptDescriptor, StickyHeaderLayout, compute_sticky_layout};
@@ -943,7 +943,7 @@ impl ScrollbackPane {
             .filter(|&d| d >= visible_range.start && d < visible_range.end)
             .map(|d| d - visible_start);
 
-        let rendered = render_scrolled_entries_with_selection_boundaries(
+        let rendered = render_scrolled_entries_with_decorations(
             buf,
             content_area,
             &entries,
@@ -961,6 +961,7 @@ impl ScrollbackPane {
             &self.media_paths,
             Some((state.group_spans(), paint_range.start)),
             state.cwd(),
+            state.decoration_map(),
         );
         let result = rendered.result;
         let selection_boundaries = rendered.selection_boundaries;
@@ -978,6 +979,7 @@ impl ScrollbackPane {
                 link_overlay: result.link_overlay,
                 inline_media: result.inline_media,
                 diagram_affordances: result.diagram_affordances,
+                decorations: result.decorations,
                 ..Default::default()
             },
             selection_boundaries,

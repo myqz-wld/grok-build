@@ -23,6 +23,9 @@ impl AgentView {
     ///
     /// Scroll events are handled at app level (not here).
     pub(super) fn handle_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
+        if let Some(outcome) = self.handle_annotation_card_mouse(mouse) {
+            return outcome;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.left_mouse_down = true;
@@ -881,6 +884,9 @@ impl AgentView {
                 } else {
                     InputOutcome::Unchanged
                 }
+            }
+            MouseEventKind::Up(MouseButton::Right) => {
+                self.open_annotation_context_menu(mouse.column, mouse.row)
             }
             MouseEventKind::Moved => {
                 tracing::debug!(

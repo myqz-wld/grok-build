@@ -1656,6 +1656,93 @@ async fn fork_filter_clears_updates() {
     assert_eq!(result.updates_copied, 0, "fork_filter should clear updates");
 }
 #[tokio::test]
+async fn annotation_fork_copies_only_the_selected_turn_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("annotation-parent"),
+        cwd: "/src".to_string(),
+    };
+    let target = Info {
+        id: acp::SessionId::new("annotation-child"),
+        cwd: "/src".to_string(),
+    };
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    for item in [
+        ConversationItem::system("system"),
+        ConversationItem::user("question zero"),
+        ConversationItem::assistant("answer zero"),
+        ConversationItem::user("question one"),
+        ConversationItem::assistant("answer one"),
+    ] {
+        adapter.append_chat_message(&source, &item).await.unwrap();
+    }
+    let notification = acp::SessionNotification::new(
+        source.id.clone(),
+        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+            acp::TextContent::new("must not replay"),
+        ))),
+    );
+    adapter
+        .append_update(&source, &SessionUpdate::Acp(Box::new(notification)))
+        .await
+        .unwrap();
+    std::fs::write(adapter.plan_file(&source), b"plan").unwrap();
+    std::fs::write(adapter.plan_mode_state_file(&source), b"{}").unwrap();
+    std::fs::write(adapter.signals_file(&source), b"{}").unwrap();
+    std::fs::write(adapter.session_dir(&source).join("tool_state.json"), b"{}").unwrap();
+    std::fs::write(adapter.announcement_state_file(&source), b"{}").unwrap();
+    let compaction_dir = adapter
+        .session_dir(&source)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR);
+    std::fs::create_dir_all(&compaction_dir).unwrap();
+    std::fs::write(compaction_dir.join("INDEX.md"), b"archive").unwrap();
+
+    let request = crate::session::ForkSessionRequest {
+        source_session_id: source.id.to_string(),
+        source_cwd: source.cwd.clone(),
+        new_cwd: target.cwd.clone(),
+        new_session_id: Some(target.id.to_string()),
+        target_prompt_index: Some(0),
+        session_kind: Some("annotation".into()),
+        ..Default::default()
+    };
+    let result = adapter
+        .copy_session_data(
+            &source,
+            &target,
+            crate::session::copy_options_for_request(&request),
+        )
+        .await
+        .unwrap();
+    let loaded = adapter.load_session(&target).await.unwrap();
+
+    assert_eq!(loaded.summary.session_kind.as_deref(), Some("annotation"));
+    assert_eq!(loaded.summary.hidden, Some(true));
+    assert!(loaded.summary.is_hidden());
+    assert_eq!(loaded.summary.parent_session_id.as_deref(), Some("annotation-parent"));
+    assert_eq!(loaded.summary.fork_context_source.as_deref(), Some("forked"));
+    assert_eq!(loaded.chat_history.len(), 3);
+    assert!(loaded.chat_history.iter().any(|item| format!("{item:?}").contains("answer zero")));
+    assert!(!loaded.chat_history.iter().any(|item| format!("{item:?}").contains("question one")));
+    assert!(loaded.updates.is_empty());
+    assert!(!result.plan_state_copied);
+    assert!(!result.plan_mode_state_copied);
+    assert!(!result.signals_copied);
+    assert!(!result.tool_state_copied);
+    assert!(!result.announcement_state_copied);
+    assert_eq!(result.compaction_segments_copied, 0);
+    assert!(!adapter.plan_file(&target).exists());
+    assert!(!adapter.plan_mode_state_file(&target).exists());
+    assert!(!adapter.signals_file(&target).exists());
+    assert!(!adapter.session_dir(&target).join("tool_state.json").exists());
+    assert!(!adapter.announcement_state_file(&target).exists());
+    assert!(!adapter
+        .session_dir(&target)
+        .join(xai_chat_state::compaction_transcript::COMPACTION_DIR)
+        .exists());
+}
+#[tokio::test]
 async fn init_session_stamps_configured_profile_on_new_session() {
     let tmp = TempDir::new().unwrap();
     let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());

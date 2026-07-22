@@ -974,6 +974,14 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent_id,
             silent: true,
         });
+        let restore_annotations = !app.screen_mode.is_minimal() && !agent.chat_kind;
+        agent.reset_annotations_for_session_load(restore_annotations);
+        if restore_annotations {
+            effects.push(Effect::LoadAnnotationState {
+                agent_id,
+                parent_session_id: hydrate_sid.to_string(),
+            });
+        }
         if let Some((model_id, effort)) = deferred {
             agent.session.model_switch_pending = true;
             effects.push(Effect::SwitchModel {

@@ -2898,6 +2898,7 @@ impl MvpAgent {
             session_yolo_mode,
             session_auto_mode,
             prompt_display_cwd,
+            actor_policy,
         } = spec;
         let _timer = crate::instrumentation_timer!("session.spawn_and_register");
         reject_direct_hub_cloud_meta(session_meta)?;
@@ -2973,7 +2974,7 @@ impl MvpAgent {
             std::sync::Arc::new(TerminalRunner::new(notifier, session_info.id.clone()))
         };
         let load_envrc = self.cfg.borrow().session.load_envrc.unwrap_or(true);
-        let startup_hints = init
+        let mut startup_hints = init
             .meta
             .as_ref()
             .and_then(|m| m.get("startupHints"))
@@ -2981,6 +2982,7 @@ impl MvpAgent {
                 serde_json::from_value::<crate::session::StartupHints>(v.clone()).ok()
             })
             .unwrap_or_default();
+        startup_hints.actor_policy = actor_policy;
         let hunk_plan = plan_hunk_tracking(
             init
                 .client_capabilities
@@ -3565,7 +3567,10 @@ impl MvpAgent {
                     persisted_plan_mode,
                     persisted_goal_mode,
                     persisted_announcement_state,
-                    self.memory_config.clone(),
+                    actor_policy
+                        .allows_memory()
+                        .then(|| self.memory_config.clone())
+                        .flatten(),
                     loc_tracking_enabled,
                     feedback_flags,
                     self.managed_mcp_cache.clone(),

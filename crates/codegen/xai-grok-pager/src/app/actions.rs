@@ -135,6 +135,20 @@ pub enum Action {
     },
     /// Send the current prompt text to the agent.
     SendPrompt(String),
+    /// Create a hidden inline-annotation thread for a validated selection.
+    BeginInlineAnnotation {
+        anchor: crate::annotations::AnnotationAnchor,
+        question: String,
+    },
+    /// Append a question to an existing hidden annotation child.
+    FollowUpInlineAnnotation {
+        thread_id: crate::annotations::ThreadId,
+        question: String,
+    },
+    /// Cancel only the active answer in one annotation child.
+    CancelInlineAnnotation(crate::annotations::ThreadId),
+    /// Persist a tombstone for an idle annotation card.
+    DeleteInlineAnnotation(crate::annotations::ThreadId),
     /// Submit a clicked follow-up suggestion chip as a LITERAL model prompt.
     /// The suggestion text is server/model-controlled, so it must bypass
     /// slash-command and exit-alias resolution (a `/always-approve` or `/quit`
@@ -1382,6 +1396,52 @@ pub enum Effect {
         /// Conversation-entry bit (`source == "conversation"`), not sticky `--chat`.
         chat_kind: bool,
     },
+    /// Load the parent-owned inline annotation event log without changing the
+    /// foreground/root session.
+    LoadAnnotationState {
+        agent_id: AgentId,
+        parent_session_id: String,
+    },
+    /// Fork a hidden zero-tool child through the anchor's containing turn.
+    ForkAnnotation {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        parent_session_id: String,
+        parent_cwd: std::path::PathBuf,
+        anchor: crate::annotations::AnnotationAnchor,
+        question: String,
+    },
+    /// Append one already-ordered event from the annotation runtime's FIFO.
+    PersistAnnotationEvent {
+        agent_id: AgentId,
+        parent_session_id: String,
+        event: crate::annotations::AnnotationEvent,
+    },
+    /// Lazily load a hidden annotation child. Replay is disabled because the
+    /// parent event log is the annotation UI's source of truth.
+    LoadAnnotationSession {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        session_id: acp::SessionId,
+        cwd: std::path::PathBuf,
+    },
+    /// Send one initial/follow-up question to a hidden annotation child.
+    PromptAnnotation {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        session_id: acp::SessionId,
+        prompt_id: String,
+        text: String,
+    },
+    /// Cancel only the owning annotation child's active exchange.
+    CancelAnnotation {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        session_id: acp::SessionId,
+    },
     /// Scan enabled foreign session stores without delaying the native list.
     ScanForeignSessions {
         cwd: std::path::PathBuf,
@@ -2130,6 +2190,64 @@ pub enum TaskResult {
         agent_id: AgentId,
         session_id: acp::SessionId,
         error: String,
+    },
+    AnnotationStateLoaded {
+        agent_id: AgentId,
+        parent_session_id: String,
+        state: crate::annotations::AnnotationState,
+        warnings: Vec<crate::annotations::AnnotationWarning>,
+        existing_child_sessions: std::collections::HashSet<String>,
+    },
+    AnnotationStateLoadFailed {
+        agent_id: AgentId,
+        parent_session_id: String,
+        error: String,
+    },
+    AnnotationForkReady {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        child_session_id: acp::SessionId,
+        cwd: std::path::PathBuf,
+    },
+    AnnotationForkFailed {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        error: String,
+    },
+    AnnotationEventPersisted {
+        agent_id: AgentId,
+        event_id: uuid::Uuid,
+    },
+    AnnotationEventPersistFailed {
+        agent_id: AgentId,
+        event_id: uuid::Uuid,
+        error: String,
+    },
+    AnnotationSessionLoaded {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        session_id: acp::SessionId,
+    },
+    AnnotationSessionLoadFailed {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        session_id: acp::SessionId,
+        error: String,
+    },
+    AnnotationPromptFinished {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        prompt_id: String,
+        result: Result<acp::PromptResponse, String>,
+    },
+    AnnotationCancelFinished {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+        exchange_id: crate::annotations::ExchangeId,
+        result: Result<(), String>,
     },
     /// Local `summary.json` title read for [`Effect::HydrateSessionTitleFromDisk`].
     SessionTitleFromDisk {

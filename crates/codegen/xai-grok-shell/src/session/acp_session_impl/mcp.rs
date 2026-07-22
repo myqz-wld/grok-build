@@ -649,6 +649,11 @@ impl SessionActor {
     /// Suppressed when the active template manages MCP context elsewhere. The
     /// dirty flag is still cleared.
     pub(super) async fn maybe_inject_mcp_reminder(&self) {
+        if !self.startup_hints.actor_policy.allows_mcp_reminders() {
+            self.mcp_reminder_dirty
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if !self
             .mcp_reminder_dirty
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1036,6 +1041,9 @@ impl SessionActor {
         Ok(())
     }
     pub(super) async fn maybe_inject_mcp_connecting_reminder(&self) {
+        if !self.startup_hints.actor_policy.allows_mcp_reminders() {
+            return;
+        }
         if self.mcp_connecting_reminder_injected.get() {
             return;
         }
@@ -1067,6 +1075,9 @@ impl SessionActor {
     }
     /// Ensure MCP tools are initialized (spawns processes and performs handshakes on first call)
     pub(super) async fn ensure_mcp_tools_initialized(&self) {
+        if !self.startup_hints.actor_policy.allows_tools() {
+            return;
+        }
         let (mcp_server_configs, meta_config_map, generation, existing_client_names, has_acp) = {
             let mut mcp_state = self.mcp_state.lock().await;
             if !mcp_state.try_start_init() {

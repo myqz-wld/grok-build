@@ -61,6 +61,31 @@ fn generate_fork_session_id(_source_id: &str) -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+pub(crate) fn copy_options_for_request(request: &ForkSessionRequest) -> CopySessionOptions {
+    let is_annotation = request.session_kind.as_deref() == Some("annotation");
+    CopySessionOptions {
+        parent_session_id: Some(request.source_session_id.clone()),
+        new_model_id: request.new_model_id.clone(),
+        target_prompt_index: request.target_prompt_index,
+        session_kind: request.session_kind.clone(),
+        hidden: is_annotation.then_some(true),
+        fork_context_source: is_annotation.then(|| "forked".to_string()),
+        source_workspace_dir: request.source_workspace_dir.clone(),
+        // Ordinary forks retain the parent's auxiliary state and compaction
+        // archive. Annotation children receive only the safe conversation
+        // prefix needed to answer the selected historical question.
+        copy_plan_state: !is_annotation,
+        copy_plan_mode_state: !is_annotation,
+        copy_signals: !is_annotation,
+        copy_tool_state: !is_annotation,
+        copy_announcement_state: !is_annotation,
+        copy_compaction_segments: !is_annotation,
+        fork_filter: is_annotation,
+        strip_reasoning: is_annotation,
+        ..Default::default()
+    }
+}
+
 /// Fork a saved session to a new working directory.
 pub async fn fork_session(
     request: ForkSessionRequest,
@@ -68,6 +93,13 @@ pub async fn fork_session(
     auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
 ) -> io::Result<ForkSessionResponse> {
     let t0 = std::time::Instant::now();
+    let is_annotation = request.session_kind.as_deref() == Some("annotation");
+    if is_annotation && request.target_prompt_index.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "annotation forks require target_prompt_index",
+        ));
+    }
 
     let root_dir = grok_home();
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
@@ -93,18 +125,7 @@ pub async fn fork_session(
     // Runs on the blocking thread pool so concurrent fork copies can execute
     // truly in parallel (on a LocalSet, async copy_session_data serializes
     // because the sync disk I/O blocks the single-threaded runtime).
-    let options = CopySessionOptions {
-        parent_session_id: Some(request.source_session_id.clone()),
-        new_model_id: request.new_model_id.clone(),
-        target_prompt_index: request.target_prompt_index,
-        session_kind: request.session_kind.clone(),
-        source_workspace_dir: request.source_workspace_dir.clone(),
-        // Carry the parent's compaction segment archive into the fork so the
-        // child retains pre-compaction history (the live summary is already
-        // copied via chat_history.jsonl).
-        copy_compaction_segments: true,
-        ..Default::default()
-    };
+    let options = copy_options_for_request(&request);
 
     let result = tokio::task::spawn_blocking(move || {
         storage.copy_session_data_sync(&source_info, &target_info, options)
@@ -121,7 +142,7 @@ pub async fn fork_session(
     // learns about the session when the background task completes.
     // Spawning removes the network round-trip (~200-400ms) from the
     // critical path.
-    if let Some(am) = auth_manager {
+    if !is_annotation && let Some(am) = auth_manager {
         let sid = new_session_id.clone();
         let cwd = request.new_cwd.clone();
         let parent = request.source_session_id.clone();
@@ -322,5 +343,50 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         // new_model_id should not be present in JSON when None
         assert!(!json.contains("new_model_id"));
+    }
+
+    #[test]
+    fn annotation_copy_options_are_hidden_and_state_free() {
+        let request = ForkSessionRequest {
+            source_session_id: "parent".into(),
+            source_cwd: "/parent".into(),
+            new_cwd: "/child".into(),
+            target_prompt_index: Some(3),
+            session_kind: Some("annotation".into()),
+            ..Default::default()
+        };
+        let options = copy_options_for_request(&request);
+        assert_eq!(options.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(options.target_prompt_index, Some(3));
+        assert_eq!(options.session_kind.as_deref(), Some("annotation"));
+        assert_eq!(options.hidden, Some(true));
+        assert_eq!(options.fork_context_source.as_deref(), Some("forked"));
+        assert!(options.fork_filter);
+        assert!(options.strip_reasoning);
+        assert!(!options.copy_plan_state);
+        assert!(!options.copy_plan_mode_state);
+        assert!(!options.copy_signals);
+        assert!(!options.copy_tool_state);
+        assert!(!options.copy_announcement_state);
+        assert!(!options.copy_compaction_segments);
+    }
+
+    #[tokio::test]
+    async fn annotation_fork_requires_cutoff() {
+        let err = fork_session(
+            ForkSessionRequest {
+                source_session_id: "parent".into(),
+                source_cwd: "/parent".into(),
+                new_cwd: "/child".into(),
+                session_kind: Some("annotation".into()),
+                ..Default::default()
+            },
+            "test-agent",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("target_prompt_index"));
     }
 }

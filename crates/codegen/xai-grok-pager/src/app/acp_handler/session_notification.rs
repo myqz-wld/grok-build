@@ -140,6 +140,12 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
     };
     let parent_id = matched.agent_id();
     let is_active = is_matched_agent_active(app, parent_id);
+    if matches!(matched, SessionMatch::Annotation { .. }) {
+        // ACP AgentMessageChunk notifications carry the answer stream. The
+        // parent-owned prompt task supplies the terminal result, so xAI child
+        // lifecycle broadcasts do not mutate root/subagent UI state.
+        return false;
+    }
     let agent = app
         .agents
         .get_mut(&parent_id)

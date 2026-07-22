@@ -856,7 +856,7 @@ impl JsonlStorageAdapter {
             fork_context_source: options.fork_context_source,
             fork_parent_prompt_id: options.fork_parent_prompt_id,
             inherited_prefix_len,
-            hidden: None,
+            hidden: options.hidden,
             source_workspace_dir: options.source_workspace_dir,
             git_root_dir: None,
             git_remotes: Vec::new(),

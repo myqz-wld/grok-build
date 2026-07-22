@@ -4,6 +4,9 @@
 use super::{
     AgentPane, AgentView, DEFAULT_SELECTION_HIGHLIGHT_DURATION_MS, MULTI_CLICK_TIMEOUT_MS,
 };
+use crate::annotations::{
+    AnnotationAnchor, AnnotationSelectionError, build_annotation_anchor, resolve_transcript_entry,
+};
 use crate::app::app_view::InputOutcome;
 use crate::scrollback::table_geometry::{CellRef, TableGeometry};
 use crate::scrollback::text_selection::{
@@ -672,6 +675,114 @@ impl AgentView {
         .map(|text| (text, SelectionKind::Linear))
     }
 
+    /// Convert the held visual selection into a replay-stable annotation
+    /// anchor. This is intentionally a one-way boundary: rendered coordinates
+    /// are consumed here and never persisted.
+    pub(crate) fn selected_annotation_anchor(
+        &self,
+    ) -> Result<AnnotationAnchor, AnnotationSelectionError> {
+        if self.active_subagent.is_some() {
+            return Err(AnnotationSelectionError::UnsupportedEntry);
+        }
+        let selection = self
+            .persistent_text_selection
+            .ok_or(AnnotationSelectionError::EmptySelection)?;
+        if selection.entry_idx == BTW_OVERLAY_ENTRY_IDX {
+            return Err(AnnotationSelectionError::UnsupportedEntry);
+        }
+        let content_width = self
+            .last_scrollback_selection_model
+            .visible_block_content_width(selection.entry_idx)
+            .ok_or(AnnotationSelectionError::InvalidRenderedRange)?;
+        let drag = ActiveTextDrag {
+            anchor: RangeHit {
+                entry_idx: selection.entry_idx,
+                range_id: selection.range_id,
+                block_line_idx: selection.anchor.block_line_idx,
+                col_within_range: selection.anchor.col_within_range,
+            },
+            head: RangeHit {
+                entry_idx: selection.entry_idx,
+                range_id: selection.range_id,
+                block_line_idx: selection.head.block_line_idx,
+                col_within_range: selection.head.col_within_range,
+            },
+            kind: selection.kind,
+            anchor_content_width: Some(content_width),
+        };
+        let (selected_text, resolved_kind) = self
+            .reconstruct_drag_copy(&drag)
+            .ok_or(AnnotationSelectionError::InvalidRenderedRange)?;
+        let resolved_drag = ActiveTextDrag {
+            kind: resolved_kind,
+            ..drag
+        };
+
+        let absolute_idx = self
+            .scrollback
+            .visible_entry_range()
+            .start
+            .saturating_add(selection.entry_idx);
+        let transcript = resolve_transcript_entry(&self.scrollback, absolute_idx)?;
+        let entry = self
+            .scrollback
+            .get(absolute_idx)
+            .ok_or(AnnotationSelectionError::EntryOutOfBounds)?;
+        let appearance = self.scrollback.appearance();
+        entry.ensure_cached(content_width, appearance, false, self.scrollback.cwd());
+        let rendered = entry.cached_rendered_output_ref();
+        let parent_session_id = self
+            .session
+            .session_id
+            .as_ref()
+            .map(|session_id| session_id.0.as_ref())
+            .ok_or(AnnotationSelectionError::MissingParentSession)?;
+
+        build_annotation_anchor(
+            parent_session_id,
+            &transcript,
+            &rendered.output.lines,
+            &resolved_drag,
+            &selected_text,
+        )
+    }
+
+    /// Hit-test a right-click against the currently held text selection.
+    /// Coordinates remain transient; only `selected_annotation_anchor` crosses
+    /// the persistence boundary.
+    pub(crate) fn annotation_selection_contains_point(&self, col: u16, row: u16) -> bool {
+        let Some(selection) = self.persistent_text_selection else {
+            return false;
+        };
+        if selection.entry_idx == BTW_OVERLAY_ENTRY_IDX {
+            return false;
+        }
+        let Some(hit) = self
+            .last_scrollback_selection_model
+            .hit_test_text_exact(col, row)
+        else {
+            return false;
+        };
+        if hit.entry_idx != selection.entry_idx || hit.range_id != selection.range_id {
+            return false;
+        }
+        let point = (hit.block_line_idx, hit.col_within_range);
+        let anchor = (
+            selection.anchor.block_line_idx,
+            selection.anchor.col_within_range,
+        );
+        let head = (
+            selection.head.block_line_idx,
+            selection.head.col_within_range,
+        );
+        let (start, end) = if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        point >= start && point <= end
+    }
+
     /// Persist a finished drag as the highlight. `kind` is the copied
     /// shape, not `drag.kind`: a degraded table drag persists `Linear` and
     /// drops its orphaned side-car.
@@ -1273,6 +1384,109 @@ mod tests {
 
     fn table_geometry() -> TableGeometry {
         TableGeometry::detect(|i| TABLE.get(i).map(|s| s.to_string()), 1).expect("grid detected")
+    }
+
+    #[test]
+    fn completed_selection_converts_through_copy_path_to_stable_anchor() {
+        use crate::scrollback::RenderBlock;
+        use crate::scrollback::blocks::UserPromptBlock;
+        use crate::scrollback::types::block_line_selectable_width;
+
+        let mut agent = make_agent();
+        agent.session.session_id = Some(agent_client_protocol::SessionId::new("test-session"));
+        let mut user = UserPromptBlock::new(
+            "first logical line with enough words to wrap\nsecond logical line",
+        );
+        user.prompt_index = Some(4);
+        agent.scrollback.push_block(RenderBlock::UserPrompt(user));
+
+        let width = 18u16;
+        let output = {
+            let entry = agent.scrollback.get(0).unwrap();
+            entry.ensure_cached(
+                width,
+                agent.scrollback.appearance(),
+                false,
+                agent.scrollback.cwd(),
+            );
+            entry.cached_rendered_output_ref().output.clone()
+        };
+        let last_idx = output.lines.len() - 1;
+        let last_col = block_line_selectable_width(&output.lines[last_idx]).saturating_sub(1);
+        agent
+            .last_scrollback_selection_model
+            .visible_blocks
+            .push(VisibleBlockGeometry {
+                entry_idx: 0,
+                area: Rect::new(0, 0, width, output.lines.len() as u16),
+                content_area: Rect::new(0, 0, width, output.lines.len() as u16),
+                selection_area: Rect::new(0, 0, width, output.lines.len() as u16),
+                content_width: width,
+                top_clipped: false,
+                bottom_clipped: false,
+                drag_startable: true,
+            });
+        agent.persistent_text_selection = Some(PersistentTextSelection {
+            entry_idx: 0,
+            range_id: 0,
+            anchor: SelectionEndpoint {
+                block_line_idx: 0,
+                col_within_range: 0,
+            },
+            head: SelectionEndpoint {
+                block_line_idx: last_idx,
+                col_within_range: last_col,
+            },
+            origin: SelectionOrigin::Drag,
+            kind: SelectionKind::Linear,
+        });
+
+        let anchor = agent.selected_annotation_anchor().unwrap();
+        assert_eq!(anchor.parent_session_id, "test-session");
+        assert_eq!(anchor.transcript_key.to_string(), "prompt:4:user:0");
+        assert_eq!((anchor.start_source_line, anchor.end_source_line), (1, 2));
+        assert_eq!(
+            anchor.selected_text,
+            "first logical line with enough words to wrap\nsecond logical line"
+        );
+    }
+
+    #[test]
+    fn annotation_context_hit_requires_exact_point_inside_held_selection() {
+        let mut agent = make_agent();
+        let mut model = ResolvedSelectionModel::default();
+        model.push_line(ResolvedSelectableLine {
+            entry_idx: 0,
+            range_id: 7,
+            block_line_idx: 3,
+            screen_y: 9,
+            screen_x: 10,
+            selectable_cols: 0..10,
+            text: "0123456789".into(),
+            joiner_to_previous: None,
+        });
+        agent.update_scrollback_selection_state(model, Default::default());
+        agent.persistent_text_selection = Some(PersistentTextSelection {
+            entry_idx: 0,
+            range_id: 7,
+            anchor: SelectionEndpoint {
+                block_line_idx: 3,
+                col_within_range: 2,
+            },
+            head: SelectionEndpoint {
+                block_line_idx: 3,
+                col_within_range: 5,
+            },
+            origin: SelectionOrigin::Drag,
+            kind: SelectionKind::Linear,
+        });
+
+        assert!(agent.annotation_selection_contains_point(12, 9));
+        assert!(agent.annotation_selection_contains_point(15, 9));
+        assert!(!agent.annotation_selection_contains_point(11, 9));
+        assert!(!agent.annotation_selection_contains_point(16, 9));
+        assert!(!agent.annotation_selection_contains_point(40, 9));
+        assert!(!agent.annotation_selection_contains_point(12, 10));
     }
 
     /// Agent whose TABLE lines are in the visible model but with no

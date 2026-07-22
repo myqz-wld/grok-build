@@ -717,6 +717,21 @@ pub fn default_actions(mouse_reporting_toggle_enabled: bool) -> Vec<ActionDef> {
             ),
         },
         ActionDef {
+            id: ActionId::AnnotateSelection,
+            label: "annotate",
+            description: "Annotate selected historical text",
+            default_key: key!('a', ALT),
+            alt_keys: vec![],
+            category: Category::ConversationAction,
+            context: When::AgentScreen,
+            hint_priority: None,
+            hint_key_display: Some("Alt+A"),
+            requires_confirmation: false,
+            long_help: Some(
+                "Opens a question composer for selected text in a completed User or Assistant message.\nThe answer runs in a hidden, tool-free fork through that message's turn and appears inline as a persistent annotation.",
+            ),
+        },
+        ActionDef {
             id: ActionId::NewSession,
             label: "new",
             description: "New session",

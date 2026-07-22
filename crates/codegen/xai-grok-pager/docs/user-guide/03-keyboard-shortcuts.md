@@ -131,6 +131,7 @@ Actions that affect the agent session, available from the agent screen.
 | `Ctrl+G` | Agent screen | Send the current task to the background |
 | `Ctrl+T` | Agent screen | Toggle the todos pane |
 | `Ctrl+B` | Agent screen | Toggle the tasks pane |
+| `Alt+A` | Agent screen | Ask a question about selected historical User or Assistant text |
 | `Ctrl+L` | Agent screen | Open the extensions modal (**non–VS Code family only**; on VS Code / Cursor / Windsurf / Zed, `Ctrl+L` is mid-turn **interject** and extensions open via `/plugins` / `/hooks`) |
 | `↑` | Prompt focused (empty prompt, normal input mode) | Open the history panel with your last prompt filled in; `↑`/`↓` step through entries (each lands in the input), `↓` at the newest closes the panel, and typing edits the recalled prompt in place. Recalled `!` shell commands re-enter shell mode. `↓` never opens history. |
 | `!` | Prompt focused | Enter shell mode (type `!` on an empty prompt) |
@@ -196,6 +197,33 @@ Send-now is intentionally interruptive — it reads as "stop what you're doing a
 > **Windows (non–VS Code family)**: Some consoles drop the `Ctrl` modifier on `Ctrl+Enter` (it can collapse to bare `Enter` or `Ctrl+J`). Use `Ctrl+I` as the alt — letter-key Ctrl chords are stable everywhere. On VS Code family, use **`Ctrl+L`**.
 
 > **VS Code family `Ctrl+L`**: Grok uses it for interject and leaves the extensions shortcut unbound (open plugins with `/plugins` or the command palette). If your terminal profile still maps **Clear** (or another command) to `Ctrl+L`, that host binding can steal the chord — rebind or remove it so the PTY receives form feed (`\x0c`).
+
+## Inline Annotations (Standard TUI)
+
+Select text inside one completed User or Assistant message, then press `Alt+A`.
+Where the terminal forwards right-click events, right-clicking inside the held
+selection also opens an **Annotate selection** action. `Alt+A` is the portable
+path because some terminals reserve right-click.
+
+Enter a question and press `Enter` to submit. `Shift+Enter` inserts a newline,
+and `Esc` closes the composer without creating a child session. The answer
+streams into a persistent card after the selected logical source line; terminal
+resize and text rewrapping do not change which line the card annotates.
+
+Card actions let you expand/collapse the thread, ask a follow-up in the same
+child session, intentionally open that child, cancel its active answer, or
+delete the parent-side card record. The hidden child inherits conversation
+history only through the selected message's turn and runs without tools,
+backend search, or memory injection. Annotation text does not enter the parent
+model context, transcript export, or search.
+
+If child creation fails, the draft card offers **retry** and **dismiss**. If
+the source message later disappears or changes, the card moves to a detached
+fallback instead of attaching to a different line.
+
+V1 accepts a selection from exactly one completed text message. Tool output,
+thinking, diffs, images, streaming content, cross-message selections, and
+`--minimal` are not supported.
 
 ---
 

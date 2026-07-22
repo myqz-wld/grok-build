@@ -1761,6 +1761,9 @@ impl Drop for TurnMetrics {
         self.span.record("turn_model_calls", self.turn_model_calls);
     }
 }
+#[cfg(test)]
+#[path = "acp_session_tests/annotation_policy_tests.rs"]
+mod annotation_policy_tests;
 /// Token rotation on the sampler/inference path is owned by the
 /// proactive refresh loop and the per-turn pre-request refresh
 /// (`refresh_token_if_expired`). `handle_sampling_failure` surfaces

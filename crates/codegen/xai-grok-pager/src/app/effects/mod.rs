@@ -579,6 +579,237 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::LoadAnnotationState {
+            agent_id,
+            parent_session_id,
+        } => {
+            let task_parent_session_id = parent_session_id.clone();
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let store = crate::annotations::AnnotationStore::for_parent_session(
+                        &task_parent_session_id,
+                    )?;
+                    let loaded = store.load()?;
+                    let existing_child_sessions = loaded
+                        .state
+                        .threads
+                        .values()
+                        .filter(|thread| {
+                            xai_grok_shell::session::session_exists_by_id(
+                                &thread.child_session_id,
+                            )
+                        })
+                        .map(|thread| thread.child_session_id.clone())
+                        .collect();
+                    Ok::<_, std::io::Error>((
+                        loaded.state,
+                        loaded.warnings,
+                        existing_child_sessions,
+                    ))
+                })
+                .await;
+                match result {
+                    Ok(Ok((state, warnings, existing_child_sessions))) => {
+                        TaskResult::AnnotationStateLoaded {
+                            agent_id,
+                            parent_session_id,
+                            state,
+                            warnings,
+                            existing_child_sessions,
+                        }
+                    }
+                    Ok(Err(error)) => TaskResult::AnnotationStateLoadFailed {
+                        agent_id,
+                        parent_session_id,
+                        error: sanitize_user_error(&error.to_string()),
+                    },
+                    Err(error) => TaskResult::AnnotationStateLoadFailed {
+                        agent_id,
+                        parent_session_id,
+                        error: sanitize_user_error(&format!("annotation load task failed: {error}")),
+                    },
+                }
+            });
+        }
+        Effect::ForkAnnotation {
+            agent_id,
+            thread_id,
+            exchange_id,
+            parent_session_id,
+            parent_cwd,
+            anchor,
+            question: _,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let cwd = parent_cwd.to_string_lossy().to_string();
+                let payload = serde_json::json!({
+                    "sourceSessionId": parent_session_id,
+                    "sourceCwd": cwd,
+                    "newCwd": cwd,
+                    "targetPromptIndex": anchor.target_prompt_index,
+                    "sessionKind": "annotation",
+                });
+                let req = acp::ExtRequest::new(
+                    "x.ai/session/fork",
+                    serde_json::value::to_raw_value(&payload)
+                        .expect("serialize annotation fork params")
+                        .into(),
+                );
+                match acp_send(req, &tx).await {
+                    Ok(response) => {
+                        if let Some(error) =
+                            crate::app::session_startup::fork_response_error(response.0.get())
+                        {
+                            return TaskResult::AnnotationForkFailed {
+                                agent_id,
+                                thread_id,
+                                exchange_id,
+                                error: sanitize_user_error(error.trim_matches('"')),
+                            };
+                        }
+                        match crate::app::session_startup::fork_response_new_session_id(
+                            response.0.get(),
+                        ) {
+                            Some(session_id) => TaskResult::AnnotationForkReady {
+                                agent_id,
+                                thread_id,
+                                exchange_id,
+                                child_session_id: acp::SessionId::new(session_id),
+                                cwd: parent_cwd,
+                            },
+                            None => TaskResult::AnnotationForkFailed {
+                                agent_id,
+                                thread_id,
+                                exchange_id,
+                                error: "annotation fork response missing newSessionId".into(),
+                            },
+                        }
+                    }
+                    Err(error) => TaskResult::AnnotationForkFailed {
+                        agent_id,
+                        thread_id,
+                        exchange_id,
+                        error: sanitize_user_error(&format!("annotation fork failed: {error}")),
+                    },
+                }
+            });
+        }
+        Effect::PersistAnnotationEvent {
+            agent_id,
+            parent_session_id,
+            event,
+        } => {
+            let event_id = event.event_id;
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::annotations::AnnotationStore::for_parent_session(&parent_session_id)?
+                        .append(&event)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => TaskResult::AnnotationEventPersisted { agent_id, event_id },
+                    Ok(Err(error)) => TaskResult::AnnotationEventPersistFailed {
+                        agent_id,
+                        event_id,
+                        error: sanitize_user_error(&error.to_string()),
+                    },
+                    Err(error) => TaskResult::AnnotationEventPersistFailed {
+                        agent_id,
+                        event_id,
+                        error: sanitize_user_error(&format!(
+                            "annotation persistence task failed: {error}"
+                        )),
+                    },
+                }
+            });
+        }
+        Effect::LoadAnnotationSession {
+            agent_id,
+            thread_id,
+            session_id,
+            cwd,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let meta = serde_json::json!({ "noReplay": true })
+                    .as_object()
+                    .cloned();
+                let request = acp::LoadSessionRequest::new(session_id.clone(), cwd)
+                    .mcp_servers(Vec::new())
+                    .meta(meta);
+                match acp_send(request, &tx).await {
+                    Ok(_) => TaskResult::AnnotationSessionLoaded {
+                        agent_id,
+                        thread_id,
+                        session_id,
+                    },
+                    Err(error) => TaskResult::AnnotationSessionLoadFailed {
+                        agent_id,
+                        thread_id,
+                        session_id,
+                        error: sanitize_user_error(&error.to_string()),
+                    },
+                }
+            });
+        }
+        Effect::PromptAnnotation {
+            agent_id,
+            thread_id,
+            exchange_id,
+            session_id,
+            prompt_id,
+            text,
+        } => {
+            let tx = acp_tx.clone();
+            let is_api_key_auth = session_flags.is_api_key_auth;
+            tasks.spawn(async move {
+                let prompt = vec![plain_prompt_content_block(text, &[])];
+                let request = acp::PromptRequest::new(session_id, prompt).meta(
+                    prompt_request_meta(&prompt_id, Some("standard"))
+                        .as_object()
+                        .cloned(),
+                );
+                let result = acp_send(request, &tx)
+                    .await
+                    .map_err(|error| format_acp_error(&error, is_api_key_auth));
+                TaskResult::AnnotationPromptFinished {
+                    agent_id,
+                    thread_id,
+                    exchange_id,
+                    prompt_id,
+                    result,
+                }
+            });
+        }
+        Effect::CancelAnnotation {
+            agent_id,
+            thread_id,
+            exchange_id,
+            session_id,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let request = acp::CancelNotification::new(session_id).meta(
+                    serde_json::json!({
+                        "cancelSubagents": false,
+                        "cancelTrigger": "annotation",
+                    })
+                    .as_object()
+                    .cloned(),
+                );
+                let result = acp_send(request, &tx)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| sanitize_user_error(&error.to_string()));
+                TaskResult::AnnotationCancelFinished {
+                    agent_id,
+                    thread_id,
+                    exchange_id,
+                    result,
+                }
+            });
+        }
         Effect::ScanForeignSessions { cwd, compat, grok_home, coordinator, seq } => {
             if coordinator.latest_seq() != seq {
                 return (false, meta);

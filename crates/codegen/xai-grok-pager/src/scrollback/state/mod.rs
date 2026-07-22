@@ -18,7 +18,7 @@ pub use types::*;
 
 use layout::LayoutCache;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::Instant;
 
@@ -44,6 +44,10 @@ pub struct ScrollbackState {
     /// All entries in the scrollback, keyed by EntryId for O(1) lookup.
     /// IndexMap preserves insertion order for rendering.
     entries: IndexMap<EntryId, ScrollbackEntry>,
+
+    /// Visual rows owned by parent-side UI features. Decorations affect
+    /// height/scrolling but never become transcript entries.
+    decorations: HashMap<EntryId, Vec<super::decorations::ScrollbackDecoration>>,
 
     /// Next entry ID to assign.
     next_id: u64,
@@ -216,6 +220,7 @@ impl ScrollbackState {
     pub fn new() -> Self {
         Self {
             entries: IndexMap::new(),
+            decorations: HashMap::new(),
             next_id: 1, // Start at 1 so 0 can be a sentinel
             running: HashSet::new(),
             flashing: Vec::new(),
@@ -346,6 +351,7 @@ impl ScrollbackState {
             "append_entries_from requires a fresh_continuation sibling (shared id space)"
         );
         self.entries.extend(tail.entries);
+        self.decorations.extend(tail.decorations);
         self.running.extend(tail.running);
         self.dirty_heights.extend(tail.dirty_heights);
         // Carry the tail's committed frontier: with a per-entry flag this
@@ -647,6 +653,7 @@ impl ScrollbackState {
         self.dirty_heights.remove(&id);
         self.committed.remove(&id);
         self.expanded_groups.remove(&id);
+        self.decorations.remove(&id);
         if let Some(sel) = self.selected
             && sel >= self.entries.len()
         {
@@ -682,6 +689,7 @@ impl ScrollbackState {
                 self.dirty_heights.remove(&id);
                 self.committed.remove(&id);
                 self.expanded_groups.remove(&id);
+                self.decorations.remove(&id);
                 removed.push(entry);
             }
         }
@@ -1025,6 +1033,7 @@ impl ScrollbackState {
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.decorations.clear();
         self.running.clear();
         self.flashing.clear();
         self.dirty_heights.clear();
@@ -1483,6 +1492,79 @@ impl ScrollbackState {
     /// Iterate over all entries mutably.
     pub fn entries_mut(&mut self) -> indexmap::map::ValuesMut<'_, EntryId, ScrollbackEntry> {
         self.entries.values_mut()
+    }
+
+    /// Replace the current visual decoration set.
+    ///
+    /// Content-only changes with the same row counts do not invalidate entry
+    /// heights; anchor/row-count changes dirty only the affected entries.
+    pub fn set_decorations(&mut self, decorations: Vec<super::decorations::ScrollbackDecoration>) {
+        let mut next: HashMap<EntryId, Vec<super::decorations::ScrollbackDecoration>> =
+            HashMap::new();
+        for decoration in decorations {
+            next.entry(decoration.entry_id)
+                .or_default()
+                .push(decoration);
+        }
+
+        let same_layout = self.decorations.len() == next.len()
+            && self.decorations.iter().all(|(entry_id, current)| {
+                next.get(entry_id).is_some_and(|replacement| {
+                    current.len() == replacement.len()
+                        && current
+                            .iter()
+                            .zip(replacement)
+                            .all(|(a, b)| a.layout_key() == b.layout_key())
+                })
+            });
+        let same_content = same_layout
+            && self.decorations.iter().all(|(entry_id, current)| {
+                next.get(entry_id).is_some_and(|replacement| {
+                    current
+                        .iter()
+                        .zip(replacement)
+                        .all(|(a, b)| a.revision == b.revision)
+                })
+            });
+        let affected: HashSet<EntryId> = self
+            .decorations
+            .keys()
+            .chain(next.keys())
+            .copied()
+            .collect();
+        self.decorations = next;
+
+        if !same_layout {
+            self.dirty_heights.extend(
+                affected
+                    .into_iter()
+                    .filter(|id| self.entries.contains_key(id)),
+            );
+        }
+        if !same_content {
+            self.bump_generation();
+        }
+    }
+
+    pub(crate) fn decorations_for_entry(
+        &self,
+        entry_id: EntryId,
+    ) -> &[super::decorations::ScrollbackDecoration] {
+        self.decorations.get(&entry_id).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn decoration_map(
+        &self,
+    ) -> &HashMap<EntryId, Vec<super::decorations::ScrollbackDecoration>> {
+        &self.decorations
+    }
+
+    pub(super) fn decoration_rows_for_entry(&self, entry_id: EntryId) -> u16 {
+        self.decorations_for_entry(entry_id)
+            .iter()
+            .fold(0u16, |rows, decoration| {
+                rows.saturating_add(decoration.row_count())
+            })
     }
 
     // Widget Helpers (used by ScrollbackPane widget)

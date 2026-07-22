@@ -1517,6 +1517,9 @@ impl SessionActor {
     ///
     /// [`conversation_has_memory_context`]: crate::session::helpers::memory_context::conversation_has_memory_context
     pub(crate) async fn first_turn_memory_reminder(&self) -> Option<String> {
+        if !self.startup_hints.actor_policy.allows_memory() {
+            return None;
+        }
         if self
             .memory
             .context_injected
@@ -1730,6 +1733,10 @@ impl SessionActor {
         artifact_tracker: Option<&crate::upload::manifest::ArtifactTracker>,
         json_schema: Option<serde_json::Value>,
     ) -> Result<TurnOutcome, acp::Error> {
+        let json_schema = self
+            .startup_hints
+            .actor_policy
+            .filter_json_schema(json_schema);
         let conv_turn_start = std::time::Instant::now();
         self.maybe_refresh_model_metadata_on_resume().await;
         self.maybe_compact_on_model_switch().await;
@@ -1862,11 +1869,12 @@ impl SessionActor {
             {
                 tracing::error!(error = % e, "Pre-sampling auto-compaction failed");
             }
-            let use_backend_search =
-                self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+            let use_backend_search = self.backend_search_allowed();
             tracing::debug!(use_backend_search, "backend_search: turn tool resolution");
             let mut effective_tools: Vec<ToolSpec> =
-                if let Some(ref override_tools) = self.forked_tool_override {
+                if !self.startup_hints.actor_policy.allows_tools() {
+                    Vec::new()
+                } else if let Some(ref override_tools) = self.forked_tool_override {
                     override_tools.clone()
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
@@ -1888,7 +1896,7 @@ impl SessionActor {
                 .build_request(
                     effective_tools,
                     memory_reminder,
-                    self.memory.is_enabled(),
+                    self.startup_hints.actor_policy.allows_memory() && self.memory.is_enabled(),
                     trace_gcs_config
                         .clone()
                         .map(|cfg| -> Box<dyn crate::sampling::TraceContext> {

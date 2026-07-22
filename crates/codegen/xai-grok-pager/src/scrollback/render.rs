@@ -7,7 +7,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::block::{BlockContent, RenderBlock};
-use super::entry::ScrollbackEntry;
+use super::decorations::{DecorationPlacement, EntryDecorationLayout, ScrollbackDecoration};
+use super::entry::{EntryId, ScrollbackEntry};
 use super::layout::HorizontalLayout;
 use super::state::EntryLayoutInfo;
 use super::state::groups::{GroupKind, GroupSpan, span_containing};
@@ -178,6 +179,8 @@ pub struct ScrollRenderResult {
     pub inline_media: Vec<InlineMediaPlacement>,
     /// Diagram affordance rows to paint + register click hit-rects for.
     pub diagram_affordances: Vec<DiagramAffordancePlacement>,
+    /// Parent-side visual decoration cards visible in this frame.
+    pub decorations: Vec<DecorationPlacement>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -283,6 +286,92 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
     group_spans: Option<(&[GroupSpan], usize)>,
     cwd: Option<&std::path::Path>,
 ) -> ScrollRenderResultWithBoundaries {
+    render_scrolled_entries_impl(
+        buf,
+        viewport,
+        entries,
+        scroll_offset,
+        selected_idx,
+        theme,
+        appearance,
+        entry_layouts_cache,
+        tick,
+        mouse_pos,
+        dim_from_entry,
+        search_highlight,
+        content_y0,
+        entry_index_base,
+        media_paths,
+        group_spans,
+        cwd,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_scrolled_entries_with_decorations(
+    buf: &mut Buffer,
+    viewport: Rect,
+    entries: &[&ScrollbackEntry],
+    scroll_offset: usize,
+    selected_idx: Option<usize>,
+    theme: &Theme,
+    appearance: &AppearanceConfig,
+    entry_layouts_cache: &[EntryLayoutInfo],
+    tick: u64,
+    mouse_pos: Option<(u16, u16)>,
+    dim_from_entry: Option<usize>,
+    search_highlight: Option<&regex::Regex>,
+    content_y0: usize,
+    entry_index_base: usize,
+    media_paths: &[std::path::PathBuf],
+    group_spans: Option<(&[GroupSpan], usize)>,
+    cwd: Option<&std::path::Path>,
+    decorations: &std::collections::HashMap<EntryId, Vec<ScrollbackDecoration>>,
+) -> ScrollRenderResultWithBoundaries {
+    render_scrolled_entries_impl(
+        buf,
+        viewport,
+        entries,
+        scroll_offset,
+        selected_idx,
+        theme,
+        appearance,
+        entry_layouts_cache,
+        tick,
+        mouse_pos,
+        dim_from_entry,
+        search_highlight,
+        content_y0,
+        entry_index_base,
+        media_paths,
+        group_spans,
+        cwd,
+        Some(decorations),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_scrolled_entries_impl(
+    buf: &mut Buffer,
+    viewport: Rect,
+    entries: &[&ScrollbackEntry],
+    scroll_offset: usize,
+    selected_idx: Option<usize>,
+    theme: &Theme,
+    appearance: &AppearanceConfig,
+    entry_layouts_cache: &[EntryLayoutInfo],
+    tick: u64,
+    mouse_pos: Option<(u16, u16)>,
+    dim_from_entry: Option<usize>,
+    search_highlight: Option<&regex::Regex>,
+    content_y0: usize,
+    entry_index_base: usize,
+    media_paths: &[std::path::PathBuf],
+    group_spans: Option<(&[GroupSpan], usize)>,
+    cwd: Option<&std::path::Path>,
+    decorations: Option<&std::collections::HashMap<EntryId, Vec<ScrollbackDecoration>>>,
+) -> ScrollRenderResultWithBoundaries {
     if entries.is_empty() || viewport.width == 0 || viewport.height == 0 {
         return ScrollRenderResultWithBoundaries::default();
     }
@@ -323,6 +412,9 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
     let mut y = content_y0;
     for (i, entry) in entries.iter().enumerate() {
         let height = entry_layouts_cache[i].height;
+        let entry_decorations = decorations
+            .and_then(|items| items.get(&entry.id))
+            .map_or(&[][..], Vec::as_slice);
         let entry_start = y;
         let entry_end = entry_start + height as usize;
 
@@ -440,7 +532,8 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
             .with_group_header_count(entry_layout_info.group_header_count)
             .with_group_collapse_header(entry_layout_info.group_collapse_header)
             .with_group_header_label(header_label.as_ref())
-            .with_cwd(cwd);
+            .with_cwd(cwd)
+            .with_decorations(entry_decorations);
         renderer.render(entry_content_area, buf);
 
         if dim_from_entry.is_some_and(|d| logical_idx >= d) {
@@ -486,9 +579,7 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
 
         let ctx = entry.context(content_width, appearance, cwd);
         let has_vpad = entry.block.has_vpad(&ctx);
-        let vpad_top = if has_vpad { 1u16 } else { 0 };
-        let content_skip = skip_rows.saturating_sub(vpad_top) as usize;
-        let first_visible_content_y = render_y + if skip_rows < vpad_top { 1 } else { 0 };
+        let vpad_top = if has_vpad { 1usize } else { 0 };
         let max_y = render_y + render_height;
 
         // Group-header entries draw synthetic "N more" text instead of
@@ -507,22 +598,19 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
             &cached_output.lines[..]
         };
 
-        // Expanded verb-group slot: the header consumes the slot's first
-        // screen row, so member 0's content maps one row below (mirroring
-        // EntryRenderer's collapse-header render path: when the header is
-        // scrolled off, the first skipped row is the header, not content).
-        // Shared by the selection lines, the hyperlink map, and the URL
-        // scanner below — they all read these two offsets.
-        let (first_visible_content_y, content_skip) = if verb_expanded_slot {
-            if skip_rows == 0 {
-                (first_visible_content_y + 1, content_skip)
-            } else {
-                (first_visible_content_y, content_skip.saturating_sub(1))
-            }
-        } else {
-            (first_visible_content_y, content_skip)
+        let decoration_layout = EntryDecorationLayout::new(cached_output, entry_decorations);
+        let header_rows = if verb_expanded_slot { 1usize } else { 0 };
+        let content_row_screen = |block_line_idx: usize| -> Option<u16> {
+            let content_row = decoration_layout.original_row(block_line_idx)?;
+            let virtual_y = entry_start
+                .saturating_add(header_rows)
+                .saturating_add(vpad_top)
+                .saturating_add(content_row);
+            (virtual_y >= viewport_start && virtual_y < viewport_end)
+                .then(|| viewport.y + (virtual_y - viewport_start) as u16)
         };
-        let mut screen_y = first_visible_content_y;
+        let original_screen_rows: Vec<Option<u16>> =
+            (0..mapped_lines.len()).map(content_row_screen).collect();
 
         // Labeled group header (either fold family): one synthetic selectable
         // row so drag/copy on the header yields the aggregated label text.
@@ -547,10 +635,10 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                 joiner_to_previous: None,
             });
         }
-        for (block_line_idx, line) in mapped_lines.iter().enumerate().skip(content_skip) {
-            if screen_y >= max_y {
-                break;
-            }
+        for (block_line_idx, line) in mapped_lines.iter().enumerate() {
+            let Some(screen_y) = original_screen_rows[block_line_idx] else {
+                continue;
+            };
             // Search highlight: re-run the query regex over this rendered row
             // and invert matching cells (decoupled from the source-text index,
             // mirroring `list_pane`). Each `BlockLine` is one already-wrapped
@@ -596,7 +684,6 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                 }
                 result.selection_model.push_line(resolved_line);
             }
-            screen_y += 1;
         }
 
         // Collect hyperlinks for the link overlay. Group headers render
@@ -615,12 +702,10 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
             };
             entry.block.with_hyperlinks(|hyperlinks| {
                 if !hyperlinks.is_empty() {
-                    map_hyperlinks_to_overlay(
+                    map_hyperlinks_to_overlay_at_rows(
                         hyperlinks,
                         cached_output,
-                        content_skip,
-                        first_visible_content_y,
-                        max_y,
+                        &original_screen_rows,
                         entry_row_layout.content.x,
                         content_line_offset,
                         media_paths,
@@ -632,12 +717,10 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
             // Basename/relative tool headers need the stored absolute target.
             // Hit box = selectable path span (respects bullet prepend + Selectable shift).
             {
-                for (idx, bl) in cached_output.lines.iter().enumerate().skip(content_skip) {
-                    let visible_offset = (idx - content_skip) as u16;
-                    let screen_row = first_visible_content_y + visible_offset;
-                    if screen_row >= max_y {
-                        break;
-                    }
+                for (idx, bl) in cached_output.lines.iter().enumerate() {
+                    let Some(screen_row) = original_screen_rows.get(idx).copied().flatten() else {
+                        continue;
+                    };
                     let Some(target) = bl.link_target.as_ref() else {
                         continue;
                     };
@@ -688,14 +771,14 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                     .lines
                     .iter()
                     .enumerate()
-                    .skip(content_skip)
                     .filter(|(_, bl)| bl.link_target.is_none())
-                    .map(|(idx, bl)| {
-                        let visible_offset = (idx - content_skip) as u16;
-                        let screen_row = first_visible_content_y + visible_offset;
-                        (screen_row, &bl.content, bl.joiner.as_deref())
-                    })
-                    .take_while(|(screen_row, _, _)| *screen_row < max_y);
+                    .filter_map(|(idx, bl)| {
+                        original_screen_rows
+                            .get(idx)
+                            .copied()
+                            .flatten()
+                            .map(|screen_row| (screen_row, &bl.content, bl.joiner.as_deref()))
+                    });
 
                 crate::render::osc8::scan_lines_for_url_overlays(
                     visible_lines,
@@ -721,7 +804,8 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
         for placement in media_placements {
             let image_offset = placement.row_offset as usize;
             let full_image_h = placement.rows as usize;
-            let image_virtual_start = content_y_start + image_offset;
+            let image_virtual_start =
+                content_y_start + decoration_layout.translate_content_row(image_offset);
             let image_virtual_end = image_virtual_start + full_image_h;
             let viewport_bottom = viewport_start + viewport.height as usize;
             // Keep the image clear of the right-aligned timestamp overlay
@@ -747,7 +831,8 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                 if visible_h >= 1 {
                     // Tool media exposes its second output line as the
                     // click-to-copy filepath and reserves a button row.
-                    let filepath_virtual_y = content_y_start + 1;
+                    let filepath_virtual_y =
+                        content_y_start + decoration_layout.translate_content_row(1);
                     let filepath_screen_rect = if filepath_virtual_y >= viewport_start
                         && filepath_virtual_y < viewport_bottom
                     {
@@ -792,7 +877,8 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
             entry.block.diagram_affordances(&ctx)
         };
         for aff in diagram_affordances {
-            let virtual_y = entry_start + aff.row_offset as usize;
+            let virtual_y =
+                entry_start + decoration_layout.translate_content_row(aff.row_offset as usize);
             let viewport_bottom = viewport_start + viewport.height as usize;
             if virtual_y >= viewport_start && virtual_y < viewport_bottom {
                 result.diagram_affordances.push(DiagramAffordancePlacement {
@@ -832,15 +918,18 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                 };
 
             // Filepath line (index 1) → click-to-copy.
-            let filepath_screen_rect =
-                line_screen_rect(content_y_start + 1, entry_content_area.width);
+            let filepath_screen_rect = line_screen_rect(
+                content_y_start + decoration_layout.translate_content_row(1),
+                entry_content_area.width,
+            );
 
             // Centered `[Open]` button → click-to-open. It is the second-to-last
             // content line (the last line is a blank spacer).
             let open_button_screen_rect = if content_lines >= 2 {
                 let label_w = media_open_button_label(is_video).len() as u16;
                 let col = media_open_button_col(content_width, is_video);
-                let button_virtual_y = content_y_start + (content_lines - 2);
+                let button_virtual_y =
+                    content_y_start + decoration_layout.translate_content_row(content_lines - 2);
                 line_screen_rect(button_virtual_y, label_w).map(|mut rect| {
                     rect.x = rect.x.saturating_add(col);
                     rect
@@ -873,6 +962,66 @@ pub(crate) fn render_scrolled_entries_with_selection_boundaries(
                     has_button_row: false,
                 });
             }
+        }
+
+        // Translate visible decoration rows and their caller-owned button
+        // metadata into screen-space hit areas. They remain absent from every
+        // transcript-derived output above.
+        for placement in decoration_layout.placements() {
+            let decoration_height = placement.decoration.lines.len();
+            if decoration_height == 0 {
+                continue;
+            }
+            let decoration_start = entry_start
+                .saturating_add(header_rows)
+                .saturating_add(vpad_top)
+                .saturating_add(placement.start_row);
+            let decoration_end = decoration_start.saturating_add(decoration_height);
+            if decoration_start >= viewport_end || decoration_end <= viewport_start {
+                continue;
+            }
+            let visible_start = decoration_start.max(viewport_start);
+            let visible_end = decoration_end.min(viewport_end);
+            let area = Rect {
+                x: entry_row_layout.content.x,
+                y: viewport.y + (visible_start - viewport_start) as u16,
+                width: entry_row_layout.content.width,
+                height: u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX),
+            };
+            let buttons = placement
+                .decoration
+                .buttons
+                .iter()
+                .filter_map(|button| {
+                    let row = decoration_start.saturating_add(button.row);
+                    if row < viewport_start || row >= viewport_end {
+                        return None;
+                    }
+                    let col = button.col.min(entry_row_layout.content.width);
+                    let width = button
+                        .width
+                        .min(entry_row_layout.content.width.saturating_sub(col));
+                    (width > 0).then(|| {
+                        (
+                            button.action.clone(),
+                            Rect {
+                                x: entry_row_layout.content.x + col,
+                                y: viewport.y + (row - viewport_start) as u16,
+                                width,
+                                height: 1,
+                            },
+                        )
+                    })
+                })
+                .collect();
+            result.decorations.push(DecorationPlacement {
+                id: placement.decoration.id.clone(),
+                area,
+                top_clipped: decoration_start < viewport_start,
+                bottom_clipped: decoration_end > viewport_end,
+                exact_anchor: placement.exact_anchor,
+                buttons,
+            });
         }
 
         // Track selected entry
@@ -996,6 +1145,41 @@ pub(crate) fn map_hyperlinks_to_overlay(
                 id: Some(h.id),
             });
         }
+    }
+}
+
+/// Decoration-aware hyperlink mapping. The ordinary mapper first resolves
+/// markdown's pre-wrap coordinates to original `BlockOutput` row indices;
+/// this adapter then translates those indices to their interleaved screen rows.
+#[allow(clippy::too_many_arguments)]
+fn map_hyperlinks_to_overlay_at_rows(
+    hyperlinks: &[xai_grok_markdown::HyperlinkTarget],
+    block_output: &BlockOutput,
+    screen_rows: &[Option<u16>],
+    content_x: u16,
+    content_line_offset: usize,
+    media_paths: &[std::path::PathBuf],
+    overlay: &mut LinkOverlay,
+) {
+    let mut indexed = LinkOverlay::new();
+    map_hyperlinks_to_overlay(
+        hyperlinks,
+        block_output,
+        0,
+        0,
+        u16::MAX,
+        content_x,
+        content_line_offset,
+        media_paths,
+        &mut indexed,
+    );
+    for link in indexed.links() {
+        let Some(Some(screen_row)) = screen_rows.get(usize::from(link.screen_row)) else {
+            continue;
+        };
+        let mut translated = link.clone();
+        translated.screen_row = *screen_row;
+        overlay.push(translated);
     }
 }
 

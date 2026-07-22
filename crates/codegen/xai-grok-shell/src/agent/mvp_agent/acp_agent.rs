@@ -1080,6 +1080,7 @@ impl acp::Agent for MvpAgent {
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd: None,
+                        actor_policy: crate::session::SessionActorPolicy::Standard,
                     }
             };
             self.spawn_and_register_session(init, spawn_opts).await
@@ -1620,6 +1621,9 @@ impl acp::Agent for MvpAgent {
                         session_yolo_mode,
                         session_auto_mode: session_auto_mode && !session_yolo_mode,
                         prompt_display_cwd,
+                        actor_policy: crate::session::SessionActorPolicy::from_session_kind(
+                            summary.session_kind.as_deref(),
+                        ),
                     },
                 )
                 .await?;

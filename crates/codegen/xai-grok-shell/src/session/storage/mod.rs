@@ -717,6 +717,8 @@ pub struct CopySessionOptions {
     /// Override `session_kind` in the forked summary. Defaults to `"fork"`.
     /// Subagent resume sets `"subagent_resume"`.
     pub session_kind: Option<String>,
+    /// Visibility override for the forked summary.
+    pub hidden: Option<bool>,
     /// How the fork's initial context was bootstrapped: `"new"` or `"forked"`.
     pub fork_context_source: Option<String>,
     /// Parent prompt/turn ID that triggered this fork.
@@ -765,6 +767,7 @@ impl Default for CopySessionOptions {
             skip_cwd_transform: false,
             prompt_display_cwd: None,
             session_kind: None,
+            hidden: None,
             fork_context_source: None,
             fork_parent_prompt_id: None,
             copy_plan_state: true,

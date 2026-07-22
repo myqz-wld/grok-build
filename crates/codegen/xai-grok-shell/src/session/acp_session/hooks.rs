@@ -153,8 +153,9 @@ impl SessionActor {
     /// `has_enabled_hooks_for_canonical` for the precise check the stop gate
     /// uses), while client hooks are checked per event.
     pub(super) fn hook_event_active(&self, event: HookEventName) -> bool {
-        self.hook_registry.borrow().is_some()
-            || self.client_hooks.borrow().contains_key(&event.canonical())
+        self.startup_hints.actor_policy.allows_tools()
+            && (self.hook_registry.borrow().is_some()
+                || self.client_hooks.borrow().contains_key(&event.canonical()))
     }
 
     /// Build the envelope for an observe-only event, fire observe client hooks for it, and

@@ -302,6 +302,7 @@ impl UserPromptBlock {
                         Selectable::All
                     },
                     selection_range: Some(USER_PROMPT_BODY_RANGE),
+                    source_line: Some(logical_idx + 1),
                     content: line,
                     ..Default::default()
                 });
@@ -408,6 +409,7 @@ impl UserPromptBlock {
                         },
                         selection_range: Some(USER_PROMPT_BODY_RANGE),
                         joiner,
+                        source_line: Some(logical_idx + 1),
                         ..Default::default()
                     });
                     all_lines.push(block_line);
@@ -430,6 +432,7 @@ impl UserPromptBlock {
                     },
                     selection_range: Some(USER_PROMPT_BODY_RANGE),
                     joiner,
+                    source_line: Some(logical_idx + 1),
                     ..Default::default()
                 });
                 all_lines.push(block_line);
@@ -449,6 +452,7 @@ impl UserPromptBlock {
                 content: Line::from(Span::styled(prefix.trim().to_string(), prefix_style)),
                 selectable: Selectable::All,
                 selection_range: Some(USER_PROMPT_BODY_RANGE),
+                source_line: Some(1),
                 ..Default::default()
             }));
         }
@@ -975,6 +979,45 @@ mod tests {
         assert!(lines[0].joiner.is_none());
         // Second line: also no joiner (hard break between logical lines)
         assert!(lines[1].joiner.is_none());
+    }
+
+    #[test]
+    fn prompt_source_lines_survive_wrapping_blank_lines_and_resize() {
+        let block = UserPromptBlock::new(
+            "first logical line with enough words to wrap\n\nthird logical line",
+        );
+        let wide = block.wrap_prompt_lines(80, None, true, false);
+        let narrow = block.wrap_prompt_lines(14, None, true, false);
+
+        assert_eq!(
+            wide.iter().map(|line| line.source_line).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+        assert!(narrow.len() > wide.len());
+        assert!(
+            narrow
+                .iter()
+                .filter(|line| line.source_line == Some(1))
+                .count()
+                > 1
+        );
+        assert!(narrow.iter().any(|line| line.source_line == Some(2)));
+        assert!(narrow.iter().any(|line| line.source_line == Some(3)));
+    }
+
+    #[test]
+    fn prompt_cjk_soft_wrap_keeps_one_based_source_lines() {
+        let block = UserPromptBlock::new("这是第一行很长的中文文本\n第二行");
+        let lines = block.wrap_prompt_lines(10, None, false, false);
+
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.source_line == Some(1))
+                .count()
+                > 1
+        );
+        assert_eq!(lines.last().and_then(|line| line.source_line), Some(2));
     }
 
     #[test]

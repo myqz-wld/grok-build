@@ -543,6 +543,26 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
 
                     is_active
                 }
+                Some(SessionMatch::Annotation {
+                    agent_id: parent_id,
+                    thread_id: _,
+                }) => {
+                    let is_active = is_matched_agent_active(app, parent_id);
+                    let parent = app
+                        .agents
+                        .get_mut(&parent_id)
+                        .expect("find_session_match returned an existing AgentId");
+                    let child_session_id = notif.request.session_id.to_string();
+                    let changed = parent.handle_annotation_update(
+                        parent_id,
+                        &child_session_id,
+                        notif.request.update,
+                        &meta,
+                    );
+                    let effects = std::mem::take(&mut parent.pending_effects);
+                    app.pending_effects.extend(effects);
+                    changed && is_active
+                }
                 None => {
                     tracing::debug!(
                         session_id = notif.request.session_id.0.as_ref(),

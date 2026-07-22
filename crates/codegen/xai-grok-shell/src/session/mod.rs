@@ -12,6 +12,7 @@ pub mod two_pass;
 pub use self::acp_session::*;
 pub use self::acp_types::*;
 pub use self::commands::*;
+pub(crate) use self::fork::copy_options_for_request;
 pub use self::fork::{ForkSessionRequest, ForkSessionResponse, fork_session};
 pub use self::handle::*;
 pub use self::persistence::{

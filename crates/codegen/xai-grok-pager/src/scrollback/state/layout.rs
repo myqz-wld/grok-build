@@ -647,6 +647,7 @@ impl ScrollbackState {
         let entry_area_width = self.entry_area_width(width);
         let cwd = self.cwd.as_deref();
         let inline_edit_height = self.inline_edit_height;
+        let decorations = &self.decorations;
 
         let Some(cache) = self.layout_cache.as_mut() else {
             return false;
@@ -673,9 +674,16 @@ impl ScrollbackState {
             let renderer = EntryRenderer::new(entry, &theme)
                 .with_appearance(self.appearance.clone())
                 .with_cwd(cwd);
+            let decoration_rows = decorations.get(entry_id).map_or(0, |items| {
+                items.iter().fold(0u16, |rows, decoration| {
+                    rows.saturating_add(decoration.row_count())
+                })
+            });
             cache.entries[idx].height = match inline_edit_height {
                 Some((edit_id, h)) if edit_id == *entry_id => h,
-                _ => renderer.desired_height(entry_area_width),
+                _ => renderer
+                    .desired_height(entry_area_width)
+                    .saturating_add(decoration_rows),
             };
             // Truncated height only feeds prompt sticky-header min_height, so
             // only prompts pay for the extra Truncated-mode render; others keep
@@ -957,6 +965,7 @@ impl ScrollbackState {
         let entry_area_width = self.entry_area_width(width);
         let cwd = self.cwd.as_deref();
         let inline_edit_height = self.inline_edit_height;
+        let decorations = &self.decorations;
         let Some(cache) = self.layout_cache.as_mut() else {
             return Vec::new();
         };
@@ -984,9 +993,16 @@ impl ScrollbackState {
             let renderer = EntryRenderer::new(entry, &theme)
                 .with_appearance(self.appearance.clone())
                 .with_cwd(cwd);
+            let decoration_rows = decorations.get(&id).map_or(0, |items| {
+                items.iter().fold(0u16, |rows, decoration| {
+                    rows.saturating_add(decoration.row_count())
+                })
+            });
             let new_height = match inline_edit_height {
                 Some((edit_id, h)) if edit_id == id => h,
-                _ => renderer.desired_height(entry_area_width),
+                _ => renderer
+                    .desired_height(entry_area_width)
+                    .saturating_add(decoration_rows),
             };
             let old_height = cache.entries[idx].height;
             // This entry now has an exact (re)measured height, so it no longer
@@ -1208,14 +1224,21 @@ impl ScrollbackState {
         let theme = Theme::current();
 
         // Borrow the new entry to compute its layout info.
-        let Some((_, new_entry)) = self.entries.get_index(new_idx) else {
+        let Some((new_entry_id, new_entry)) = self.entries.get_index(new_idx) else {
             return false;
         };
 
         let renderer = EntryRenderer::new(new_entry, &theme)
             .with_appearance(self.appearance.clone())
             .with_cwd(cwd);
-        let height = renderer.desired_height(entry_area_width);
+        let decoration_rows = self.decorations.get(new_entry_id).map_or(0, |items| {
+            items.iter().fold(0u16, |rows, decoration| {
+                rows.saturating_add(decoration.row_count())
+            })
+        });
+        let height = renderer
+            .desired_height(entry_area_width)
+            .saturating_add(decoration_rows);
         let is_prompt = new_entry.block.is_user_prompt();
         // Truncated height only feeds prompt sticky-header min_height; only
         // prompts pay for the extra Truncated-mode render (others seed the MAX).
@@ -1311,11 +1334,13 @@ impl ScrollbackState {
         // are filled in for the visible viewport by `settle_visible_measurements`
         // (called from `prepare_layout`); off-screen entries stay estimated until
         // they scroll in. gap_after is a placeholder (1), fixed up in pass 2.
-        for entry in self.entries.values() {
+        for (entry_id, entry) in &self.entries {
             let renderer = EntryRenderer::new(entry, &theme)
                 .with_appearance(self.appearance.clone())
                 .with_cwd(self.cwd());
-            let height = renderer.estimate_height(entry_area_width);
+            let height = renderer
+                .estimate_height(entry_area_width)
+                .saturating_add(self.decoration_rows_for_entry(*entry_id));
             cache.entries.push(EntryLayoutInfo {
                 height,
                 gap_after: 1,

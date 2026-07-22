@@ -35,6 +35,8 @@ struct RenderState {
     cache_theme: ThemeKind,
     cache_lines: Vec<Line<'static>>,
     cache_joiners: Vec<Option<String>>,
+    /// 0-based raw Markdown source line for each post-wrap cached row.
+    cache_source_lines: Vec<usize>,
     /// Number of pre-wrap (renderer output) lines that were frozen at the time
     /// we last wrapped. Lines `0..frozen_pre_wrap_count` are stable and their
     /// wrapped output is cached in `cache_lines[0..frozen_wrapped_count]`.
@@ -66,6 +68,34 @@ pub struct MarkdownContent {
 pub struct WrappedLines<'a> {
     pub lines: &'a [Line<'static>],
     pub joiners: &'a [Option<String>],
+    /// 0-based raw Markdown source line, parallel to `lines`.
+    pub source_lines: &'a [usize],
+}
+
+/// Wrap pre-rendered Markdown rows while duplicating each row's source-line
+/// identity onto all of its soft-wrapped fragments.
+fn wrap_lines_with_sources(
+    lines: Vec<Line<'static>>,
+    source_lines: Vec<usize>,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Option<String>>, Vec<usize>) {
+    debug_assert_eq!(lines.len(), source_lines.len());
+    let mut wrapped_lines = Vec::new();
+    let mut wrapped_joiners = Vec::new();
+    let mut wrapped_sources = Vec::new();
+
+    for (idx, line) in lines.into_iter().enumerate() {
+        // The renderer guarantees a parallel map. Keep a deterministic
+        // fallback in release builds so malformed future renderer output does
+        // not drop visible text.
+        let source_line = source_lines.get(idx).copied().unwrap_or(idx);
+        let (fragments, joiners) = word_wrap_lines_with_joiners(std::iter::once(line), width);
+        wrapped_sources.extend(std::iter::repeat_n(source_line, fragments.len()));
+        wrapped_lines.extend(fragments);
+        wrapped_joiners.extend(joiners);
+    }
+
+    (wrapped_lines, wrapped_joiners, wrapped_sources)
 }
 
 /// Expand tab characters to spaces using the current global tab_width.
@@ -127,6 +157,7 @@ impl MarkdownContent {
                 cache_theme: theme_cache::current_kind(),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
+                cache_source_lines: Vec::new(),
                 frozen_pre_wrap_count: 0,
                 frozen_wrapped_count: 0,
             }),
@@ -145,6 +176,7 @@ impl MarkdownContent {
                 cache_theme: theme_cache::current_kind(),
                 cache_lines: Vec::new(),
                 cache_joiners: Vec::new(),
+                cache_source_lines: Vec::new(),
                 frozen_pre_wrap_count: 0,
                 frozen_wrapped_count: 0,
             }),
@@ -283,11 +315,15 @@ impl MarkdownContent {
     /// per-block allocations, and only entries near the viewport need it hot.
     pub fn evict_wrap_cache(&self) {
         let mut state = self.state.borrow_mut();
-        if state.cache_lines.is_empty() && state.cache_joiners.is_empty() {
+        if state.cache_lines.is_empty()
+            && state.cache_joiners.is_empty()
+            && state.cache_source_lines.is_empty()
+        {
             return;
         }
         state.cache_lines = Vec::new();
         state.cache_joiners = Vec::new();
+        state.cache_source_lines = Vec::new();
         state.cache_generation = u64::MAX; // force rebuild on next use
         state.frozen_pre_wrap_count = 0;
         state.frozen_wrapped_count = 0;
@@ -360,9 +396,11 @@ impl MarkdownContent {
 
         // Step 1: Wrap any newly frozen lines
         let new_frozen_wrapped = if frozen_count > state.frozen_pre_wrap_count {
-            let new_frozen: Vec<Line<'static>> =
-                state.renderer.view().lines[state.frozen_pre_wrap_count..frozen_count].to_vec();
-            Some(word_wrap_lines_with_joiners(new_frozen, width))
+            let view = state.renderer.view();
+            let new_frozen = view.lines[state.frozen_pre_wrap_count..frozen_count].to_vec();
+            let new_sources =
+                view.line_source_map[state.frozen_pre_wrap_count..frozen_count].to_vec();
+            Some(wrap_lines_with_sources(new_frozen, new_sources, width))
         } else {
             None
         };
@@ -370,8 +408,10 @@ impl MarkdownContent {
         // Step 2: Wrap the tail (unfrozen) lines
         let total_lines = state.renderer.view().lines.len();
         let tail_wrapped = if frozen_count < total_lines {
-            let tail: Vec<Line<'static>> = state.renderer.view().lines[frozen_count..].to_vec();
-            Some(word_wrap_lines_with_joiners(tail, width))
+            let view = state.renderer.view();
+            let tail = view.lines[frozen_count..].to_vec();
+            let tail_sources = view.line_source_map[frozen_count..].to_vec();
+            Some(wrap_lines_with_sources(tail, tail_sources, width))
         } else {
             None
         };
@@ -381,19 +421,22 @@ impl MarkdownContent {
         let frozen_wc = state.frozen_wrapped_count;
         state.cache_lines.truncate(frozen_wc);
         state.cache_joiners.truncate(frozen_wc);
+        state.cache_source_lines.truncate(frozen_wc);
 
         // Append newly frozen wrapped lines
-        if let Some((new_lines, new_joiners)) = new_frozen_wrapped {
+        if let Some((new_lines, new_joiners, new_sources)) = new_frozen_wrapped {
             state.cache_lines.extend(new_lines);
             state.cache_joiners.extend(new_joiners);
+            state.cache_source_lines.extend(new_sources);
             state.frozen_pre_wrap_count = frozen_count;
             state.frozen_wrapped_count = state.cache_lines.len();
         }
 
         // Append tail wrapped lines
-        if let Some((tail_lines, tail_joiners)) = tail_wrapped {
+        if let Some((tail_lines, tail_joiners, tail_sources)) = tail_wrapped {
             state.cache_lines.extend(tail_lines);
             state.cache_joiners.extend(tail_joiners);
+            state.cache_source_lines.extend(tail_sources);
         }
 
         state.cache_width = width;
@@ -411,6 +454,7 @@ impl MarkdownContent {
         f(WrappedLines {
             lines: &state.cache_lines,
             joiners: &state.cache_joiners,
+            source_lines: &state.cache_source_lines,
         })
     }
 
@@ -433,12 +477,14 @@ impl MarkdownContent {
                         .lines
                         .iter()
                         .zip(wrapped.joiners.iter())
-                        .map(|(line, joiner)| {
+                        .zip(wrapped.source_lines.iter())
+                        .map(|((line, joiner), source_line)| {
                             let mut content = line.clone();
                             let selectable = strip.selectable(&mut content);
                             let mut block_line = BlockLine::styled(content)
                                 .with_selection_range(Some(MARKDOWN_BODY_RANGE))
-                                .with_joiner(joiner.clone());
+                                .with_joiner(joiner.clone())
+                                .with_source_line(Some(source_line + 1));
                             block_line.selectable = selectable;
                             if let Some(bg) = line.style.bg {
                                 block_line.with_background(bg)
@@ -577,6 +623,67 @@ mod tests {
         assert!(out.lines.iter().skip(1).any(|line| line.joiner.is_some()));
     }
 
+    fn assert_output_matches_renderer_source_map(md: &MarkdownContent, width: usize) {
+        let pre_wrap_map: Vec<usize> = md
+            .line_source_map()
+            .into_iter()
+            .map(|source| source + 1)
+            .collect();
+        let out = md.output(width);
+        let mut pre_wrap_idx = 0usize;
+
+        for (row, line) in out.lines.iter().enumerate() {
+            if row > 0 && line.joiner.is_none() {
+                pre_wrap_idx += 1;
+            }
+            assert_eq!(
+                line.source_line,
+                pre_wrap_map.get(pre_wrap_idx).copied(),
+                "wrapped row {row} at width {width} lost its raw source line"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_source_lines_survive_lists_code_tables_and_blank_lines() {
+        let markdown = concat!(
+            "- first list item with enough words to wrap narrowly\n",
+            "- second item\n",
+            "\n",
+            "```rust\n",
+            "let answer = 42;\n",
+            "```\n",
+            "\n",
+            "| Name | Value |\n",
+            "| --- | --- |\n",
+            "| alpha | beta |\n",
+        );
+        let md = MarkdownContent::new(markdown);
+
+        assert_output_matches_renderer_source_map(&md, 80);
+        assert_output_matches_renderer_source_map(&md, 18);
+    }
+
+    #[test]
+    fn markdown_cjk_fragments_keep_the_same_semantic_line_after_resize() {
+        let md = MarkdownContent::new("这是一个需要在窄终端中换行的中文句子  \n第二行");
+        let wide = md.output(80);
+        let narrow = md.output(10);
+
+        assert!(narrow.lines.len() > wide.lines.len());
+        assert!(
+            narrow
+                .lines
+                .iter()
+                .filter(|line| line.source_line == Some(1))
+                .count()
+                > 1,
+            "the first CJK source line should wrap into multiple fragments"
+        );
+        assert_output_matches_renderer_source_map(&md, 80);
+        assert_output_matches_renderer_source_map(&md, 10);
+    }
+
     #[test]
     fn markdown_body_lines_remain_selectable() {
         let md = MarkdownContent::new("hello");
@@ -637,6 +744,24 @@ mod tests {
         {
             assert_eq!(inc, full, "Line {i} mismatch");
         }
+
+        // Annotation anchors are available only after a message completes.
+        // `finish()` performs the production full re-render that converts the
+        // streaming renderer's checkpoint-relative source map back into full
+        // message coordinates.
+        streaming.finish();
+        let finished_output = streaming.output(width);
+        let incremental_sources: Vec<Option<usize>> = finished_output
+            .lines
+            .iter()
+            .map(|line| line.source_line)
+            .collect();
+        let full_sources: Vec<Option<usize>> = full_output
+            .lines
+            .iter()
+            .map(|line| line.source_line)
+            .collect();
+        assert_eq!(incremental_sources, full_sources);
     }
 
     /// Verify that the frozen wrap cache is actually being used (not just

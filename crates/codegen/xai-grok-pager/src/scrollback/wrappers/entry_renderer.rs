@@ -11,6 +11,7 @@ use crate::render::color::blend_color;
 use crate::render::{Renderable, SafeBuf};
 use crate::scrollback::BlockOutput;
 use crate::scrollback::block::{BlockContent, RenderBlock};
+use crate::scrollback::decorations::{EntryDecorationLayout, ScrollbackDecoration};
 use crate::scrollback::entry::ScrollbackEntry;
 use crate::scrollback::layout::HorizontalLayout;
 use crate::scrollback::types::{AccentStyle, BlockBackground, DisplayMode, Selectable};
@@ -71,6 +72,8 @@ pub struct EntryRenderer<'a> {
     hide_accent: bool,
     /// Session/worktree cwd (`AgentSession.cwd`) for Expanded tool paths.
     cwd: Option<&'a Path>,
+    /// Parent-side visual rows interleaved with this entry's content.
+    decorations: &'a [ScrollbackDecoration],
 }
 
 impl<'a> EntryRenderer<'a> {
@@ -90,11 +93,17 @@ impl<'a> EntryRenderer<'a> {
             flat_background: false,
             hide_accent: false,
             cwd: None,
+            decorations: &[],
         }
     }
 
     pub fn with_cwd(mut self, cwd: Option<&'a Path>) -> Self {
         self.cwd = cwd;
+        self
+    }
+
+    pub fn with_decorations(mut self, decorations: &'a [ScrollbackDecoration]) -> Self {
+        self.decorations = decorations;
         self
     }
 
@@ -423,6 +432,9 @@ impl<'a> EntryRenderer<'a> {
         // row / fallback caption per diagram) that live inside `output()` and are
         // invisible to this source-based estimate, so it never under-reserves.
         self.assemble_height(content_width, content_lines)
+            .saturating_add(self.decorations.iter().fold(0u16, |rows, decoration| {
+                rows.saturating_add(decoration.row_count())
+            }))
             .saturating_add(self.entry.block.estimate_extra_rows())
     }
 
@@ -625,6 +637,9 @@ impl Renderable for EntryRenderer<'_> {
         // Clamp the line count: a pathologically large block could exceed u16.
         let content_lines = self.entry.cached_output_ref().len().min(u16::MAX as usize) as u16;
         self.assemble_height(content_width, content_lines)
+            .saturating_add(self.decorations.iter().fold(0u16, |rows, decoration| {
+                rows.saturating_add(decoration.row_count())
+            }))
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -874,22 +889,35 @@ impl Renderable for EntryRenderer<'_> {
         };
         let content_skip = skip_remaining.saturating_sub(vpad_top);
 
-        let mut row = content_area.y;
+        let mut first_visible_content_y = content_area.y;
         let max_row = content_area.y + content_area.height;
 
         // Top vpad (only if not skipped)
-        if vpad_top_visible && row < max_row {
-            row += 1;
+        if vpad_top_visible && first_visible_content_y < max_row {
+            first_visible_content_y += 1;
         }
 
         // Own the timestamp gutter per row (no-bg blocks skip the full-area fill)
         // so a wide glyph can't strand a ghost; per-row bg keeps code blocks whole.
         let own_gutter = ts_reserved > 0 && bg_color.is_none() && content_area.width > ts_reserved;
 
-        // Content lines — skip the first `content_skip` lines
-        for line in output.lines.iter().skip(content_skip as usize) {
+        let decoration_layout = EntryDecorationLayout::new(output, self.decorations);
+
+        // Transcript content lines. Their source/selectable metadata remains in
+        // the original output; only their screen row is translated around the
+        // parent-owned decoration rows.
+        for (block_line_idx, line) in output.lines.iter().enumerate() {
+            let Some(virtual_row) = decoration_layout.original_row(block_line_idx) else {
+                continue;
+            };
+            if virtual_row < content_skip as usize {
+                continue;
+            }
+            let row = first_visible_content_y.saturating_add(
+                u16::try_from(virtual_row - content_skip as usize).unwrap_or(u16::MAX),
+            );
             if row >= max_row {
-                break;
+                continue;
             }
 
             // Apply line-specific background if set. Decorative panel bands
@@ -916,8 +944,26 @@ impl Renderable for EntryRenderer<'_> {
                 let gutter = Rect::new(content_area.x + text_width, row, ts_reserved, 1);
                 fill_bg_spaces(buf, gutter, line_bg.unwrap_or(self.fallback_bg()));
             }
+        }
 
-            row += 1;
+        // Decoration rows paint after the message lines they anchor to, but do
+        // not enter the block output or any transcript-derived model.
+        for placement in decoration_layout.placements() {
+            for (decoration_row, line) in placement.decoration.lines.iter().enumerate() {
+                let virtual_row = placement.start_row.saturating_add(decoration_row);
+                if virtual_row < content_skip as usize {
+                    continue;
+                }
+                let row = first_visible_content_y.saturating_add(
+                    u16::try_from(virtual_row - content_skip as usize).unwrap_or(u16::MAX),
+                );
+                if row >= max_row {
+                    continue;
+                }
+                let rect = Rect::new(content_area.x, row, content_area.width, 1);
+                buf.set_style(rect, Style::default().bg(line.background));
+                buf.set_line_safe(content_area.x, row, &line.content, content_area.width);
+            }
         }
 
         // Overlay timestamp on the first content line for message blocks.

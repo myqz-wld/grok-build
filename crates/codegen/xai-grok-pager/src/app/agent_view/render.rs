@@ -695,7 +695,8 @@ impl AgentView {
                 || self.agents_modal.is_some()
                 || self.btw_state.is_some()
                 || self.line_viewer.is_some()
-                || self.active_modal.is_some())
+                || self.active_modal.is_some()
+                || self.annotation_overlay_open())
         {
             self.inline_media_active = false;
             xai_grok_shell::util::with_locked_stderr(|stderr| {
@@ -1133,6 +1134,7 @@ impl AgentView {
             self.sync_pending_user_input_marks();
             self.scrollback.set_cwd(Some(self.session.cwd.clone()));
             let _ = self.sync_inline_edit_layout(layout.scrollback_content.width);
+            self.sync_annotation_decorations(layout.scrollback_content.width);
             self.scrollback.prepare_layout(
                 layout.scrollback_content.width,
                 layout.scrollback_content.height,
@@ -1195,6 +1197,7 @@ impl AgentView {
                             .height
                             .saturating_sub(search_reserved_rows);
                     }
+                    self.sync_annotation_decorations(layout.scrollback_content.width);
                     self.scrollback.prepare_layout(
                         layout.scrollback_content.width,
                         layout.scrollback_content.height,
@@ -1455,6 +1458,7 @@ impl AgentView {
             self.scrollback.set_cwd(Some(self.session.cwd.clone()));
             let inline_edit_dim_from =
                 self.sync_inline_edit_layout(layout.scrollback_content.width);
+            self.sync_annotation_decorations(layout.scrollback_content.width);
             self.scrollback.prepare_layout(
                 layout.scrollback_content.width,
                 layout.scrollback_content.height,
@@ -1483,6 +1487,7 @@ impl AgentView {
                     scratch,
                 );
             let sb_output = sb_rendered.output;
+            self.annotation_ui.card_placements = sb_output.decorations.clone();
             self.update_scrollback_selection_state(
                 sb_output.selection_model.clone(),
                 sb_rendered.selection_boundaries,
@@ -4143,6 +4148,28 @@ impl AgentView {
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
         }
+        let mut annotation_cursor = None;
+        if let Some(composer) = self.annotation_ui.composer.as_mut() {
+            if let Some(rendered) = crate::views::annotation::render_annotation_composer(
+                buf, area, composer, compact, &theme,
+            ) {
+                annotation_cursor = rendered.cursor_pos;
+                if let Some(escapes) = rendered.post_flush_escapes {
+                    match prompt_post_flush.as_mut() {
+                        Some(existing) => existing.append(escapes.into()),
+                        None => prompt_post_flush = Some(escapes.into()),
+                    }
+                }
+            }
+            if let Some(popup) = composer.window.popup_area {
+                self.frame_occluder_rects.push(popup);
+            }
+        } else if let Some(menu) = self.annotation_ui.context_menu.as_mut() {
+            crate::views::annotation::render_annotation_context_menu(buf, area, menu, &theme);
+            if let Some(popup) = menu.popup_area {
+                self.frame_occluder_rects.push(popup);
+            }
+        }
         self.pane_areas = layout.pane_areas();
         {
             let route = crate::hyperlink_route::hyperlink_route();
@@ -4205,7 +4232,9 @@ impl AgentView {
                 }
             }
         }
-        let cursor = if self.inline_edit.is_some() {
+        let cursor = if annotation_cursor.is_some() {
+            annotation_cursor
+        } else if self.inline_edit.is_some() {
             inline_edit_cursor
         } else {
             prompt_cursor_pos

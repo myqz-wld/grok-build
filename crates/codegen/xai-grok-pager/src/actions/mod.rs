@@ -66,6 +66,7 @@ pub enum ActionId {
     CancelTurn,
     ToggleYolo,
     ToggleMultiline,
+    AnnotateSelection,
 
     // Focus
     FocusPrompt,

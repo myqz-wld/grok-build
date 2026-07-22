@@ -13,6 +13,12 @@ pub(super) enum SessionMatch {
     /// notification's `session_id.0.as_ref()`; the caller re-derives it
     /// to avoid an extra allocation.
     Child(AgentId),
+    /// The session belongs to one parent-owned inline annotation thread. It
+    /// has no child `AgentView` and must never enter ordinary session routing.
+    Annotation {
+        agent_id: AgentId,
+        thread_id: crate::annotations::ThreadId,
+    },
 }
 
 impl SessionMatch {
@@ -26,6 +32,7 @@ impl SessionMatch {
     pub(super) fn agent_id(self) -> AgentId {
         match self {
             SessionMatch::Root(id) | SessionMatch::Child(id) => id,
+            SessionMatch::Annotation { agent_id, .. } => agent_id,
         }
     }
 }
@@ -40,6 +47,9 @@ pub(super) fn resolve_notif_agent<'a>(
     session_id: &acp::SessionId,
 ) -> Option<(SessionMatch, bool, &'a mut AgentView)> {
     let matched = find_session_match(app, session_id)?;
+    if matches!(matched, SessionMatch::Annotation { .. }) {
+        return None;
+    }
     let parent_id = matched.agent_id();
     let is_active = is_matched_agent_active(app, parent_id);
     let agent = app.agents.get_mut(&parent_id)?;
@@ -70,7 +80,10 @@ pub(super) fn mcp_target_agent<'a>(
         Some(sid) => {
             let sid = acp::SessionId::new(sid);
             let (matched, is_active, agent) = resolve_notif_agent(app, &sid)?;
-            if matches!(matched, SessionMatch::Child(_)) {
+            if matches!(
+                matched,
+                SessionMatch::Child(_) | SessionMatch::Annotation { .. }
+            ) {
                 return None;
             }
             Some((is_active, agent))
@@ -99,6 +112,8 @@ pub(super) fn resolve_target_view<'a>(
     if matches!(matched, SessionMatch::Child(_)) {
         let child_view = agent.subagent_views.get_mut(child_sid)?;
         Some((&mut child_view.session, &mut child_view.scrollback))
+    } else if matches!(matched, SessionMatch::Annotation { .. }) {
+        None
     } else {
         Some((&mut agent.session, &mut agent.scrollback))
     }
@@ -138,6 +153,7 @@ pub(super) fn find_session_match(
     // notification path.
     let child_key: &str = session_id.0.as_ref();
     let mut child_match: Option<AgentId> = None;
+    let mut annotation_match: Option<(AgentId, crate::annotations::ThreadId)> = None;
     for (id, agent) in &app.agents {
         if agent.session.session_id.as_ref() == Some(session_id) {
             return Some(SessionMatch::Root(*id));
@@ -145,9 +161,20 @@ pub(super) fn find_session_match(
         if child_match.is_none() && agent.subagent_views.contains_key(child_key) {
             child_match = Some(*id);
         }
+        if annotation_match.is_none()
+            && let Some(thread_id) = agent.annotation_runtime.sessions.get(child_key)
+        {
+            annotation_match = Some((*id, *thread_id));
+        }
     }
     if let Some(id) = child_match {
         return Some(SessionMatch::Child(id));
+    }
+    if let Some((agent_id, thread_id)) = annotation_match {
+        return Some(SessionMatch::Annotation {
+            agent_id,
+            thread_id,
+        });
     }
     // Pass 3: race-window fallback for notifications that arrive before the
     // root session_id has been assigned. Only the active agent is eligible,
@@ -184,6 +211,7 @@ pub(super) fn interaction_target_agent(app: &AppView, session_id: &str) -> Optio
     let sid = acp::SessionId::new(session_id.to_owned());
     match find_session_match(app, &sid) {
         Some(SessionMatch::Root(id) | SessionMatch::Child(id)) => Some(id),
+        Some(SessionMatch::Annotation { .. }) => None,
         None => None,
     }
 }

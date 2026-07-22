@@ -99,7 +99,7 @@ pub(super) fn handle_mcp_tools_changed(notif: &acp::ExtNotification, app: &mut A
             match find_session_match(app, &sid) {
                 // Subagent (child) sessions don't own the top-level MCP
                 // modal / connecting indicator — drop them.
-                Some(SessionMatch::Child(_)) => None,
+                Some(SessionMatch::Child(_) | SessionMatch::Annotation { .. }) => None,
                 Some(matched) => {
                     let id = matched.agent_id();
                     Some((is_matched_agent_active(app, id), id))

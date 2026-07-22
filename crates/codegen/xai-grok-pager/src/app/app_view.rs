@@ -4479,7 +4479,8 @@ impl AppView {
         let cloud_modal_open = false;
         matches!(
             self.active_view, ActiveView::Agent(id) if self.agents.get(& id)
-            .is_some_and(| a | a.extensions_modal.is_some() || a.active_modal.is_some())
+            .is_some_and(| a | a.extensions_modal.is_some() || a.active_modal.is_some() ||
+                a.annotation_overlay_open())
         ) || self.import_claude_modal.is_some()
             || self.new_worktree_dialog.is_some()
             || self.welcome_doc_viewer.is_some()

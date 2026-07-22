@@ -86,6 +86,83 @@
     }
 
     #[test]
+    fn acp_chunk_for_annotation_routes_to_thread_without_touching_root_or_child_views() {
+        let mut app = make_app_with_agent("parent");
+        let thread_id = uuid::Uuid::from_u128(100);
+        let exchange_id = uuid::Uuid::from_u128(101);
+        let selected = "selected";
+        let anchor = crate::annotations::AnnotationAnchor {
+            parent_session_id: "parent".into(),
+            transcript_key: crate::annotations::TranscriptKey {
+                prompt_index: 0,
+                role: crate::annotations::AnnotationEntryRole::Assistant,
+                ordinal: 0,
+            },
+            entry_role: crate::annotations::AnnotationEntryRole::Assistant,
+            target_prompt_index: 0,
+            start_source_line: 1,
+            end_source_line: 1,
+            selected_text: selected.into(),
+            selected_text_hash: blake3::hash(selected.as_bytes()).to_hex().to_string(),
+            surrounding_text_hash: blake3::hash(selected.as_bytes()).to_hex().to_string(),
+        };
+        {
+            let parent = app.agents.get_mut(&AgentId(0)).unwrap();
+            let created = crate::annotations::AnnotationEvent::new(
+                thread_id,
+                crate::annotations::AnnotationEventKind::ThreadCreated {
+                    anchor,
+                    child_session_id: "annotation-child".into(),
+                    first_question: "why?".into(),
+                },
+            );
+            assert!(parent.annotation_runtime.state.apply(created).is_none());
+            let started = crate::annotations::AnnotationEvent::new(
+                thread_id,
+                crate::annotations::AnnotationEventKind::ExchangeStarted {
+                    exchange_id,
+                    question: "why?".into(),
+                },
+            );
+            assert!(parent.annotation_runtime.state.apply(started).is_none());
+            parent
+                .annotation_runtime
+                .sessions
+                .insert("annotation-child".into(), thread_id);
+            parent.annotation_runtime.in_flight.insert(
+                thread_id,
+                crate::annotations::AnnotationInFlight::new(
+                    exchange_id,
+                    "why?".into(),
+                    crate::annotations::AnnotationExchangePhase::Prompting,
+                ),
+            );
+        }
+
+        assert!(matches!(
+            find_session_match(&app, &acp::SessionId::new("parent")),
+            Some(SessionMatch::Root(AgentId(0)))
+        ));
+        assert!(matches!(
+            find_session_match(&app, &acp::SessionId::new("annotation-child")),
+            Some(SessionMatch::Annotation { agent_id: AgentId(0), thread_id: id }) if id == thread_id
+        ));
+
+        let affected = handle(
+            make_agent_chunk_message("annotation-child", "thread answer"),
+            &mut app,
+        );
+        let parent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(affected, "visible parent must redraw its inline card");
+        assert!(parent.scrollback.is_empty(), "root transcript stays untouched");
+        assert!(parent.subagent_views.is_empty(), "annotation is not a subagent view");
+        assert_eq!(
+            parent.annotation_runtime.state.threads[&thread_id].exchanges[0].answer_markdown,
+            "thread answer"
+        );
+    }
+
+    #[test]
     fn acp_chunk_with_unknown_session_id_is_dropped_and_no_redraw() {
         // No agent owns the session_id and the active agent already has a
         // session_id assigned (so the race-window fallback does not fire).
@@ -296,4 +373,3 @@
             "B only",
         );
     }
-

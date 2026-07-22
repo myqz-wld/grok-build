@@ -39,6 +39,7 @@ impl AgentView {
             && self.extensions_modal.is_none()
             && self.btw_state.is_none()
             && self.scrollback_search.is_none()
+            && !self.annotation_overlay_open()
     }
     /// Whether no input-demanding overlay (permission / plan / cancel-turn /
     /// question) is awaiting a response.
@@ -75,6 +76,7 @@ impl AgentView {
             || self.gboom.is_some()
             || self.video_viewer.is_some()
             || self.image_viewer.is_some()
+            || self.annotation_overlay_open()
     }
     /// Prompt pane focused with an empty draft and no overlay or prompt-local
     /// sub-state owning keys — the state where a bare Left backs out of the
@@ -376,6 +378,17 @@ impl AgentView {
                 return child_view.handle_input_inner(ev, registry, prompt_paging);
             }
             return InputOutcome::Unchanged;
+        }
+        if self.annotation_overlay_open() {
+            if let Event::Key(key) = ev
+                && key.kind != KeyEventKind::Release
+                && registry.lookup(key, When::Always) == Some(ActionId::Quit)
+            {
+                return InputOutcome::Unchanged;
+            }
+            if let Some(outcome) = self.handle_annotation_overlay_input(ev) {
+                return outcome;
+            }
         }
         if self.dismiss_jump_picker_if_suppressed()
             && let Event::Key(key) = ev
@@ -931,6 +944,12 @@ impl AgentView {
         {
             return InputOutcome::Action(Action::AcceptWordSelectTip);
         }
+        if let Event::Key(key) = ev
+            && key.kind != KeyEventKind::Release
+            && registry.matches_id(ActionId::AnnotateSelection, key)
+        {
+            return self.open_annotation_composer_from_selection();
+        }
         let outcome = match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => match self.active_pane {
                 AgentPane::Prompt => self.handle_prompt_key(key, registry, prompt_paging),
@@ -1165,6 +1184,7 @@ impl AgentView {
                     InputOutcome::Action(Action::SetYoloMode(!self.session.is_yolo()))
                 }
             }
+            ActionId::AnnotateSelection => self.open_annotation_composer_from_selection(),
             ActionId::CommandPalette => {
                 self.active_modal = Some(crate::views::modal::ActiveModal::CommandPalette {
                     entries: crate::views::modal::default_palette_entries(self.sharing_enabled),

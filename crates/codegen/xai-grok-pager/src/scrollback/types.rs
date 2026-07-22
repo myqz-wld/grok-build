@@ -167,6 +167,11 @@ pub struct BlockLine {
     ///
     /// The first line of a block should always have `None`.
     pub joiner: Option<String>,
+    /// 1-based logical line in the raw User/Assistant message that produced
+    /// this rendered row. Every soft-wrapped fragment of the same logical
+    /// line carries the same value. Synthetic chrome and non-message blocks
+    /// leave this as `None`.
+    pub source_line: Option<usize>,
     /// Semantic link target when paint text cannot recover it (tool headers).
     pub link_target: Option<crate::render::osc8::LinkTarget>,
 }
@@ -183,6 +188,7 @@ impl Default for BlockLine {
             selection_range: None,
             selection_text: None,
             joiner: None,
+            source_line: None,
             link_target: None,
         }
     }
@@ -271,6 +277,12 @@ impl BlockLine {
     /// Set the soft-wrap joiner.
     pub fn with_joiner(mut self, joiner: Option<String>) -> Self {
         self.joiner = joiner;
+        self
+    }
+
+    /// Set the 1-based raw-message source line represented by this row.
+    pub fn with_source_line(mut self, source_line: Option<usize>) -> Self {
+        self.source_line = source_line;
         self
     }
 }
@@ -594,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn block_line_exhaustive_literal_keeps_legacy_shape() {
+    fn block_line_exhaustive_literal_tracks_all_metadata() {
         let _line = BlockLine {
             content: Line::default(),
             background: None,
@@ -605,6 +617,7 @@ mod tests {
             selection_range: None,
             selection_text: None,
             joiner: None,
+            source_line: None,
             link_target: None,
         };
     }

@@ -109,6 +109,9 @@ where
 }
 impl SessionActor {
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
+        if !self.startup_hints.actor_policy.allows_tools() {
+            return (Vec::new(), 0);
+        }
         let mcp_wait_start = std::time::Instant::now();
         match self.mcp_strategy {
             McpInitStrategy::Blocking => {
@@ -136,8 +139,10 @@ impl SessionActor {
     /// (`prepare_tool_definitions_*`); this applies only the `web_search` drop
     /// under backend search and the `ToolSpec::from` mapping.
     pub(crate) fn turn_base_tool_specs(&self, defs: &[ToolDefinition]) -> Vec<ToolSpec> {
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        if !self.startup_hints.actor_policy.allows_tools() {
+            return Vec::new();
+        }
+        let use_backend_search = self.backend_search_allowed();
         defs.iter()
             .filter(|td| !use_backend_search || td.function.name != "web_search")
             .cloned()
@@ -145,10 +150,19 @@ impl SessionActor {
             .collect()
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
+        if !self.startup_hints.actor_policy.allows_tools() {
+            return Vec::new();
+        }
         let bridge = self.agent.borrow().tool_bridge().clone();
         let defs = bridge.tool_definitions_builtins_only().await;
         let plan_active = self.plan_mode.lock().is_active();
         filter_cursor_tools_by_plan_mode(defs, plan_active)
+    }
+
+    pub(crate) fn backend_search_allowed(&self) -> bool {
+        self.startup_hints.actor_policy.allows_backend_search()
+            && self.agent.borrow().backend_search_enabled()
+            && self.supports_backend_search.get()
     }
     /// Memoized per-model [`ModelAuthFacts`](crate::agent::config::ModelAuthFacts),
     /// keyed by `model_id`.

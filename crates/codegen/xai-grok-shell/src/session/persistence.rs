@@ -954,7 +954,7 @@ impl Summary {
         self.hidden.unwrap_or(
             self.session_kind
                 .as_deref()
-                .is_some_and(|k| k.starts_with("subagent")),
+                .is_some_and(|k| k.starts_with("subagent") || k == "annotation"),
         )
     }
 
@@ -1035,7 +1035,7 @@ mod is_hidden_tests {
 
     #[test]
     fn hidden_for_all_subagent_kinds() {
-        for kind in ["subagent", "subagent_fork", "subagent_resume"] {
+        for kind in ["subagent", "subagent_fork", "subagent_resume", "annotation"] {
             assert!(
                 summary_with_kind(Some(kind)).is_hidden(),
                 "{kind} should be hidden"

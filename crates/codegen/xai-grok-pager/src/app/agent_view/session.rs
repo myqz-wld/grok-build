@@ -266,6 +266,8 @@ impl AgentView {
             session_agent_name: None,
             subagent_sessions: HashMap::new(),
             subagent_views: HashMap::new(),
+            annotation_runtime: Default::default(),
+            annotation_ui: Default::default(),
             active_subagent: None,
             is_subagent_view: false,
             hit_subagent_frame_close: Default::default(),

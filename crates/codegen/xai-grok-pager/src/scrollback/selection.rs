@@ -82,6 +82,8 @@ pub struct RenderOutput {
     pub inline_media: Vec<crate::scrollback::render::InlineMediaPlacement>,
     /// Mermaid diagram affordance rows to paint + register click hit-rects for.
     pub diagram_affordances: Vec<crate::scrollback::render::DiagramAffordancePlacement>,
+    /// Visible parent-side decoration cards and their button hit areas.
+    pub decorations: Vec<crate::scrollback::decorations::DecorationPlacement>,
 }
 
 /// Scroll information for scrollbar rendering.
@@ -112,6 +114,7 @@ impl RenderOutput {
             link_overlay: Default::default(),
             inline_media: Vec::new(),
             diagram_affordances: Vec::new(),
+            decorations: Vec::new(),
         }
     }
 

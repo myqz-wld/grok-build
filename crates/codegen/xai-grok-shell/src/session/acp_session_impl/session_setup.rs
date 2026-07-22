@@ -556,8 +556,7 @@ impl SessionActor {
             .as_ref()
             .map(xai_chat_state::estimate_system_message_tokens)
             .unwrap_or(0);
-        let use_backend_search =
-            self.agent.borrow().backend_search_enabled() && self.supports_backend_search.get();
+        let use_backend_search = self.backend_search_allowed();
         let tool_defs: Vec<_> = self
             .prepare_tool_definitions_inner()
             .await

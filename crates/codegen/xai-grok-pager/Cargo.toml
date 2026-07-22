@@ -40,6 +40,7 @@ syntect = { workspace = true }
 similar = { workspace = true }
 indexmap = { workspace = true }
 blake3 = { workspace = true }
+fs2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -101,7 +102,7 @@ xai-token-estimation = { workspace = true }
 xai-grok-telemetry = { workspace = true }
 xai-fast-worktree = { path = "../xai-fast-worktree", features = ["metadata"] }
 backon = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 flate2 = { workspace = true }
 tar = { workspace = true }
 xai-grok-tools = { workspace = true }
@@ -118,7 +119,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "tiff", "gif", "webp"] }
 
 # ID generation
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
 
 # Path computation (plan file, etc.)
 dirs = { workspace = true }

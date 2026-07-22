@@ -1,4 +1,11 @@
 //! Async task-result application: routes task results into state.
+use super::annotations::{
+    handle_annotation_cancel_finished, handle_annotation_event_persist_failed,
+    handle_annotation_event_persisted, handle_annotation_fork_failed, handle_annotation_fork_ready,
+    handle_annotation_prompt_finished, handle_annotation_session_load_failed,
+    handle_annotation_session_loaded, handle_annotation_state_load_failed,
+    handle_annotation_state_loaded,
+};
 use super::auth::{
     ensure_login_method, handle_auth_complete, handle_auth_url_ready, handle_mcp_auth_trigger_done,
     handle_mcp_setup_submit_done,
@@ -291,6 +298,77 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
             error,
         } => handle_session_load_failed(app, agent_id, session_id, error),
+        TaskResult::AnnotationStateLoaded {
+            agent_id,
+            parent_session_id,
+            state,
+            warnings,
+            existing_child_sessions,
+        } => handle_annotation_state_loaded(
+            app,
+            agent_id,
+            parent_session_id,
+            state,
+            warnings,
+            existing_child_sessions,
+        ),
+        TaskResult::AnnotationStateLoadFailed {
+            agent_id,
+            parent_session_id,
+            error,
+        } => handle_annotation_state_load_failed(app, agent_id, &parent_session_id, error),
+        TaskResult::AnnotationForkReady {
+            agent_id,
+            thread_id,
+            exchange_id,
+            child_session_id,
+            cwd: _,
+        } => handle_annotation_fork_ready(app, agent_id, thread_id, exchange_id, child_session_id),
+        TaskResult::AnnotationForkFailed {
+            agent_id,
+            thread_id,
+            exchange_id,
+            error,
+        } => handle_annotation_fork_failed(app, agent_id, thread_id, exchange_id, error),
+        TaskResult::AnnotationEventPersisted { agent_id, event_id } => {
+            handle_annotation_event_persisted(app, agent_id, event_id)
+        }
+        TaskResult::AnnotationEventPersistFailed {
+            agent_id,
+            event_id,
+            error,
+        } => handle_annotation_event_persist_failed(app, agent_id, event_id, error),
+        TaskResult::AnnotationSessionLoaded {
+            agent_id,
+            thread_id,
+            session_id,
+        } => handle_annotation_session_loaded(app, agent_id, thread_id, session_id),
+        TaskResult::AnnotationSessionLoadFailed {
+            agent_id,
+            thread_id,
+            session_id,
+            error,
+        } => handle_annotation_session_load_failed(app, agent_id, thread_id, session_id, error),
+        TaskResult::AnnotationPromptFinished {
+            agent_id,
+            thread_id,
+            exchange_id,
+            prompt_id,
+            result,
+        } => handle_annotation_prompt_finished(
+            app,
+            agent_id,
+            thread_id,
+            exchange_id,
+            prompt_id,
+            result,
+        ),
+        TaskResult::AnnotationCancelFinished {
+            agent_id,
+            thread_id,
+            exchange_id,
+            result,
+        } => handle_annotation_cancel_finished(app, agent_id, thread_id, exchange_id, result),
         TaskResult::SessionListLoaded {
             sessions,
             partial,

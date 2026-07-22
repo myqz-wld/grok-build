@@ -33,6 +33,14 @@ pub(super) fn handle_permission_request(
             return false;
         }
     };
+    if matches!(matched, SessionMatch::Annotation { .. }) {
+        tracing::error!(
+            session_id = %perm.request.session_id.0,
+            "annotation session requested permission despite zero-tool policy"
+        );
+        cancel_permission(perm);
+        return false;
+    }
     let owning_agent_id = matched.agent_id();
     let is_active = is_matched_agent_active(app, owning_agent_id);
     let Some(agent) = app.agents.get_mut(&owning_agent_id) else {

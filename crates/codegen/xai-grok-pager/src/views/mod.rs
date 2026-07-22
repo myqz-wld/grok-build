@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod agent_status;
 pub mod agents_modal;
+pub(crate) mod annotation;
 pub mod announcements;
 pub mod block_viewer;
 pub mod btw_overlay;
