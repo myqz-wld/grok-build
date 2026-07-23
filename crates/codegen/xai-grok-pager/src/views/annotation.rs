@@ -40,9 +40,15 @@ pub(crate) struct AnnotationComposerState {
 
 impl AnnotationComposerState {
     pub(crate) fn new(target: AnnotationComposerTarget, cwd: &std::path::Path) -> Self {
+        let mut prompt = PromptWidget::new_with_cwd(cwd);
+        // The inline editor is one row tall. Reuse the prompt widget's compact
+        // paste policy so pastes with two or more content lines become an
+        // atomic paste chip while retaining the original text and line breaks
+        // for submission.
+        prompt.set_compact(true);
         Self {
             target,
-            prompt: PromptWidget::new_with_cwd(cwd),
+            prompt,
             input_area: None,
         }
     }

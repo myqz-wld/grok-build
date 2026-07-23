@@ -138,8 +138,7 @@ impl AgentView {
                 }
                 crossterm::event::Event::Paste(text) => {
                     if let Some(composer) = self.annotation_ui.composer.as_mut() {
-                        let single_line = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
-                        composer.prompt.textarea.insert_str(&single_line);
+                        composer.prompt.handle_paste(text);
                     }
                     InputOutcome::Changed
                 }
@@ -2193,22 +2192,31 @@ mod tests {
     }
 
     #[test]
-    fn single_line_composer_flattens_multiline_paste() {
+    fn single_line_composer_collapses_multiline_paste_without_losing_line_breaks() {
         let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
         agent.open_annotation_composer(AnnotationComposerTarget::New { anchor: anchor() });
 
         let outcome =
-            agent.handle_annotation_overlay_input(&Event::Paste("one\r\ntwo\nthree".into()));
+            agent.handle_annotation_overlay_input(&Event::Paste("one\ntwo\nthree".into()));
 
         assert!(matches!(outcome, Some(InputOutcome::Changed)));
+        let prompt = &agent.annotation_ui.composer.as_ref().unwrap().prompt;
+        assert_eq!(prompt.text(), "one\ntwo\nthree");
         assert_eq!(
-            agent
-                .annotation_ui
-                .composer
-                .as_ref()
-                .map(|composer| composer.prompt.text()),
-            Some("one two three")
+            prompt.textarea.elements().len(),
+            1,
+            "multiline content should render as one atomic paste chip"
         );
+
+        let outcome = agent.handle_annotation_overlay_input(&Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            outcome,
+            Some(InputOutcome::Action(Action::BeginInlineAnnotation { question, .. }))
+                if question == "one\ntwo\nthree"
+        ));
     }
 
     #[test]
