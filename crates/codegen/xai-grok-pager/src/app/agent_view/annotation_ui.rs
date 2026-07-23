@@ -774,8 +774,7 @@ impl AgentView {
             };
             let Some(entry_id) = entry_id else { continue };
             let in_flight = self.annotation_runtime.in_flight.get(thread_id);
-            let expanded =
-                self.annotation_ui.expanded_threads.contains(thread_id) || in_flight.is_some();
+            let expanded = self.annotation_ui.expanded_threads.contains(thread_id);
             let active = in_flight.is_some_and(|in_flight| {
                 !matches!(
                     in_flight.phase,
@@ -1999,6 +1998,73 @@ mod tests {
             annotation_theme_revision(&Theme::groknight()),
             annotation_theme_revision(&Theme::grokday()),
             "theme changes must invalidate cached styled Markdown"
+        );
+    }
+
+    #[test]
+    fn in_flight_annotation_respects_collapse_and_stays_collapsed_on_completion() {
+        let mut thread = completed_thread();
+        thread.exchanges[0].answer_markdown = "streamed answer\n".repeat(100);
+        let thread_id = thread.thread_id;
+        let exchange_id = thread.exchanges[0].exchange_id;
+        let mut agent = agent_with_thread_card(thread);
+        agent.annotation_runtime.in_flight.insert(
+            thread_id,
+            crate::annotations::AnnotationInFlight::new(
+                exchange_id,
+                "Why?".into(),
+                AnnotationExchangePhase::Prompting,
+            ),
+        );
+
+        assert!(matches!(
+            agent.activate_annotation_card_action(thread_id, AnnotationCardAction::Toggle),
+            InputOutcome::Changed
+        ));
+        assert!(!agent.annotation_ui.expanded_threads.contains(&thread_id));
+        agent.sync_annotation_decorations(80);
+        assert!(
+            !agent
+                .annotation_ui
+                .thread_card_bodies
+                .get(&thread_id)
+                .unwrap()
+                .key
+                .expanded,
+            "an active response must not override the user's collapsed state"
+        );
+        let active_rows = agent
+            .scrollback
+            .decoration_map()
+            .values()
+            .flatten()
+            .find(|decoration| decoration.id == thread_id.to_string())
+            .unwrap()
+            .row_count();
+
+        agent.annotation_runtime.in_flight.remove(&thread_id);
+        agent.sync_annotation_decorations(80);
+        assert!(
+            !agent
+                .annotation_ui
+                .thread_card_bodies
+                .get(&thread_id)
+                .unwrap()
+                .key
+                .expanded,
+            "completion must not trigger a delayed collapse transition"
+        );
+        let completed_rows = agent
+            .scrollback
+            .decoration_map()
+            .values()
+            .flatten()
+            .find(|decoration| decoration.id == thread_id.to_string())
+            .unwrap()
+            .row_count();
+        assert_eq!(
+            active_rows, completed_rows,
+            "completion should not abruptly change a collapsed card's height"
         );
     }
 
