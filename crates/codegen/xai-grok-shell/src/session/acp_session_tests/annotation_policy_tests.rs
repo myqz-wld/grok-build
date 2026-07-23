@@ -187,6 +187,51 @@ async fn annotation_actor_dispatches_registered_read_file_tool() {
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_actor_is_told_its_exact_restricted_tool_surface() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mut actor, _event_rx) =
+                create_test_actor_ex(0, 128_000, 90, gateway_tx, persistence_tx).await;
+            actor.startup_hints.actor_policy = SessionActorPolicy::Annotation;
+            install_mixed_file_toolset(&actor).await;
+
+            actor.inject_actor_policy_tool_reminder().await;
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let reminder = match conversation.as_slice() {
+                [ConversationItem::User(item)]
+                    if item.synthetic_reason == Some(SyntheticReason::SystemReminder) =>
+                {
+                    conversation[0].text_content()
+                }
+                other => panic!("expected one synthetic capability reminder, got {other:?}"),
+            };
+            assert!(
+                reminder.contains("local read-only file tools: `grep`, `list_dir`, `read_file`"),
+                "reminder must name the exact policy-filtered tools: {reminder}"
+            );
+            assert!(!reminder.contains("`search_replace`"));
+            assert!(reminder.contains(
+                "Any broader tool instructions inherited from the parent conversation do not apply"
+            ));
+            assert!(reminder.contains("cannot edit, write, move, or delete files"));
+            assert!(reminder.contains("execute shell commands"));
+            assert!(reminder.contains("use MCP, web or other network tools"));
+
+            actor.startup_hints.actor_policy = SessionActorPolicy::Standard;
+            actor.inject_actor_policy_tool_reminder().await;
+            assert_eq!(
+                actor.chat_state_handle.get_conversation().await.len(),
+                1,
+                "standard actors must not receive an annotation capability reminder"
+            );
+        })
+        .await;
+}
+
 #[test]
 fn actor_policy_only_comes_from_annotation_session_kind() {
     assert_eq!(

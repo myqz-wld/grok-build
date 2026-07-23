@@ -128,6 +128,29 @@ impl SessionActor {
             && policy.allows_local_tool_kind(identity.tool_kind)
     }
 
+    /// Tell restricted actors their exact effective tool surface immediately
+    /// before each user turn. Repeating per turn keeps restored and long-lived
+    /// annotation threads accurate after config changes or compaction, while
+    /// leaving the inherited parent prefix untouched for cache reuse.
+    pub(super) async fn inject_actor_policy_tool_reminder(&self) {
+        let policy = self.startup_hints.actor_policy;
+        if policy == SessionActorPolicy::Standard {
+            return;
+        }
+
+        let mut tool_names = self
+            .prepare_tool_definitions_inner()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+        tool_names.sort_unstable();
+        tool_names.dedup();
+        if let Some(reminder) = policy.tool_capability_reminder(&tool_names) {
+            self.push_system_reminder(&reminder);
+        }
+    }
+
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
         let mcp_wait_ms = if self.startup_hints.actor_policy.allows_mcp_tools() {
             let mcp_wait_start = std::time::Instant::now();

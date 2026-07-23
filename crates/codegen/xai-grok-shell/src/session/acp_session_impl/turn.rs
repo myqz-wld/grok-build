@@ -699,6 +699,7 @@ impl SessionActor {
         }
         self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
+        self.inject_actor_policy_tool_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
         } else if self.is_cursor_harness() {

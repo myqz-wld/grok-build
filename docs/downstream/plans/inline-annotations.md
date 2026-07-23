@@ -447,6 +447,7 @@ Manual smoke test in a standard TUI:
   - annotation forks now require a prompt cutoff, persist `session_kind=annotation` plus `hidden=true`, and skip plan/mode/signals/tool/announcement/compaction-archive state;
   - actor capability policy is derived from the persisted summary on load and cannot be supplied through ACP startup metadata;
   - annotation requests originally exposed no tools; on 2026-07-23 this was narrowed to registered local file read/search/list tools, while MCP, mutation, commands, hosted search, memory context, and native/pseudo-tool structured output remain suppressed;
+  - each annotation turn now receives a hidden reminder naming the exact filtered tool definitions and clarifying that broader tool assumptions inherited from the parent System prompt do not apply;
   - any model call outside that read-only allowlist is rejected with an ACP protocol error before tool lifecycle events or dispatch;
   - focused fork/cutoff/hidden-state and actor-policy tests pass (6 tests at completion), and `cargo check -p xai-grok-shell` passes.
 - T5 completion (2026-07-22):

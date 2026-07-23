@@ -636,6 +636,41 @@ impl SessionActorPolicy {
         }
     }
 
+    /// Model-facing explanation of the actor's effective tool boundary.
+    ///
+    /// `tool_names` must come from the already policy-filtered definitions so
+    /// the reminder reports the exact configured names rather than assuming a
+    /// particular toolset or name override.
+    pub(crate) fn tool_capability_reminder(self, tool_names: &[String]) -> Option<String> {
+        if self == Self::Standard {
+            return None;
+        }
+
+        let available = if tool_names.is_empty() {
+            "No callable tools are currently available.".to_string()
+        } else {
+            let names = tool_names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "The only callable tools available in this session are local read-only file \
+                 tools: {names}."
+            )
+        };
+        Some(format!(
+            "You are running inside a restricted inline annotation session. {available} \
+             Use these tools only to read, search, or list local files when that context is \
+             needed to answer the annotation question. You cannot edit, write, move, or delete \
+             files; execute shell commands; use MCP, web or other network tools; access memory; \
+             spawn subagents; or perform any external or mutating action. Any broader tool \
+             instructions inherited from the parent conversation do not apply to this session. \
+             If the needed information cannot be obtained with the listed tools, say so and \
+             answer from the available context."
+        ))
+    }
+
     pub(crate) fn allows_hooks(self) -> bool {
         matches!(self, Self::Standard)
     }
