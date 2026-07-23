@@ -36,7 +36,7 @@ pub(super) fn handle_permission_request(
     if matches!(matched, SessionMatch::Annotation { .. }) {
         tracing::error!(
             session_id = %perm.request.session_id.0,
-            "annotation session requested permission despite zero-tool policy"
+            "annotation session requested permission outside its pre-approved read-only scope"
         );
         cancel_permission(perm);
         return false;

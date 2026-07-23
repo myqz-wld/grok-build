@@ -1444,7 +1444,7 @@ pub enum Effect {
         agent_id: AgentId,
         parent_session_id: String,
     },
-    /// Fork a hidden zero-tool child through the anchor's containing turn.
+    /// Fork a hidden read-only child through the anchor's containing turn.
     ForkAnnotation {
         agent_id: AgentId,
         thread_id: crate::annotations::ThreadId,

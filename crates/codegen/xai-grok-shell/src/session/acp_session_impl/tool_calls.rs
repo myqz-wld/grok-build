@@ -285,19 +285,21 @@ impl SessionActor {
         &self,
         tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
     ) -> Result<ToolLoop, acp::Error> {
-        if !self.startup_hints.actor_policy.allows_tools() && !tool_calls.is_empty() {
-            let names = tool_calls
-                .iter()
-                .map(|call| call.function.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+        let blocked_names = tool_calls
+            .iter()
+            .filter(|call| !self.actor_policy_allows_tool(&call.function.name))
+            .map(|call| call.function.name.as_str())
+            .collect::<Vec<_>>();
+        if !blocked_names.is_empty() {
+            let names = blocked_names.iter().copied().collect::<Vec<_>>().join(", ");
             tracing::error!(
                 session_id = %self.session_info.id,
                 tools = %names,
-                "annotation session returned an unexpected tool call"
+                "session returned a tool call blocked by its actor policy"
             );
             return Err(acp::Error::invalid_request().data(format!(
-                "annotation sessions cannot dispatch tool calls (received: {names})"
+                "annotation sessions may only dispatch local read-only file tools \
+                 (blocked: {names})"
             )));
         }
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {

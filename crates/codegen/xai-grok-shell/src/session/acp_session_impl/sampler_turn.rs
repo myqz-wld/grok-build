@@ -108,23 +108,44 @@ where
     }
 }
 impl SessionActor {
+    /// Defense-in-depth actor gate for one model-facing tool name.
+    ///
+    /// Standard sessions preserve the existing tool surface verbatim.
+    /// Annotation sessions require a registered, non-MCP tool whose metadata
+    /// says both "read-only" and one of the local file read/search/list kinds.
+    pub(super) fn actor_policy_allows_tool(&self, tool_name: &str) -> bool {
+        let policy = self.startup_hints.actor_policy;
+        if policy == SessionActorPolicy::Standard {
+            return true;
+        }
+
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        let Some(identity) = bridge.toolset().tool_identity(tool_name) else {
+            return false;
+        };
+        identity.namespace != xai_grok_tools::types::tool::ToolNamespace::MCP
+            && identity.read_only
+            && policy.allows_local_tool_kind(identity.tool_kind)
+    }
+
     pub(super) async fn prepare_tool_definitions_timed(&self) -> (Vec<ToolDefinition>, u64) {
-        if !self.startup_hints.actor_policy.allows_tools() {
-            return (Vec::new(), 0);
-        }
-        let mcp_wait_start = std::time::Instant::now();
-        match self.mcp_strategy {
-            McpInitStrategy::Blocking => {
-                if !self.mcp_state.lock().await.is_initialized() {
-                    tracing::info!(
-                        "Blocking strategy: waiting for MCP initialization before first prompt..."
-                    );
-                    self.wait_for_mcp_initialized().await;
+        let mcp_wait_ms = if self.startup_hints.actor_policy.allows_mcp_tools() {
+            let mcp_wait_start = std::time::Instant::now();
+            match self.mcp_strategy {
+                McpInitStrategy::Blocking => {
+                    if !self.mcp_state.lock().await.is_initialized() {
+                        tracing::info!(
+                            "Blocking strategy: waiting for MCP initialization before first prompt..."
+                        );
+                        self.wait_for_mcp_initialized().await;
+                    }
                 }
+                McpInitStrategy::Progressive => {}
             }
-            McpInitStrategy::Progressive => {}
-        }
-        let mcp_wait_ms = mcp_wait_start.elapsed().as_millis() as u64;
+            mcp_wait_start.elapsed().as_millis() as u64
+        } else {
+            0
+        };
         let defs = self.prepare_tool_definitions_inner().await;
         (defs, mcp_wait_ms)
     }
@@ -137,14 +158,13 @@ impl SessionActor {
     /// a verbatim-fork child's tool prefix can never silently drift from what the
     /// parent turn actually sends. `defs` is the already-resolved tool list
     /// (`prepare_tool_definitions_*`); this applies only the `web_search` drop
-    /// under backend search and the `ToolSpec::from` mapping.
+    /// under backend search, the actor capability gate, and the
+    /// `ToolSpec::from` mapping.
     pub(crate) fn turn_base_tool_specs(&self, defs: &[ToolDefinition]) -> Vec<ToolSpec> {
-        if !self.startup_hints.actor_policy.allows_tools() {
-            return Vec::new();
-        }
         let backend_search_active = self.backend_search_active();
         defs.iter()
             .filter(|td| !backend_search_active || td.function.name != "web_search")
+            .filter(|td| self.actor_policy_allows_tool(&td.function.name))
             .cloned()
             .map(ToolSpec::from)
             .collect()
@@ -216,13 +236,13 @@ impl SessionActor {
             .store((!effective.is_empty()).then(|| std::sync::Arc::new(effective)));
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
-        if !self.startup_hints.actor_policy.allows_tools() {
-            return Vec::new();
-        }
         let bridge = self.agent.borrow().tool_bridge().clone();
         let defs = bridge.tool_definitions_builtins_only().await;
         let plan_active = self.plan_mode.lock().is_active();
         filter_cursor_tools_by_plan_mode(defs, plan_active)
+            .into_iter()
+            .filter(|td| self.actor_policy_allows_tool(&td.function.name))
+            .collect()
     }
     /// Memoized per-model [`ModelAuthFacts`](crate::agent::config::ModelAuthFacts),
     /// keyed by `model_id`.

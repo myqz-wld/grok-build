@@ -17,10 +17,10 @@ policy is:
 
 ### Inline annotations
 
-The standard TUI can attach a persistent, threaded, tool-free hidden fork to a
-stable logical-line selection in one completed User or Assistant message.
-Annotations remain parent-side UI metadata and never become parent transcript
-blocks. `--minimal` is intentionally unchanged.
+The standard TUI can attach a persistent, threaded hidden fork with local
+read-only file tools to a stable logical-line selection in one completed User
+or Assistant message. Annotations remain parent-side UI metadata and never
+become parent transcript blocks. `--minimal` is intentionally unchanged.
 
 Primary isolated modules:
 
@@ -47,7 +47,7 @@ Review these paths carefully whenever `upstream/main` is merged or rebased into
 | Rendering and layout | `scrollback/{render.rs,scrollback_pane.rs,state/,types.rs}`, `scrollback/wrappers/entry_renderer.rs`, `app/agent_view/render.rs` | Decorations affect layout but never enter transcript blocks, transcript selection, search, replay, or export. Annotation cards expose a separate decoration-only copy/follow-up selection projection. Source-line insertion survives rewrap; missing lines use message-boundary fallback. |
 | Parent/child notification routing | `app/acp_handler/{routing.rs,session_notification.rs}`, `app/dispatch/{router.rs,task_result.rs,session/}` | Exact root routing wins; annotation children route only to their owning thread and never switch the active parent view. |
 | Fork and persistence | `xai-grok-shell/src/session/{fork.rs,persistence.rs,storage/}` | Fork history ends at `target_prompt_index`; summaries retain hidden annotation kind; parent annotation JSONL is independent of transcript JSONL. |
-| Capability enforcement | `xai-grok-shell/src/session/acp_session_impl/{session_setup.rs,sampler_turn.rs,turn.rs,tool_calls.rs,mcp.rs}`, `session/acp_session/hooks.rs` | Persisted annotation policy is authoritative: no tools, MCP, hosted search, memory injection, structured-output pseudo-tool, hooks, or unexpected tool dispatch. |
+| Capability enforcement | `xai-grok-shell/src/session/acp_session_impl/{session_setup.rs,sampler_turn.rs,turn.rs,tool_calls.rs,mcp.rs}`, `session/acp_session/hooks.rs` | Persisted annotation policy is authoritative: only registered local read/search/list file tools are exposed and dispatchable; MCP, mutation, commands, hosted search, memory injection, structured-output pseudo-tools, hooks, and unexpected tool dispatch remain blocked. |
 
 Paths in the table are relative to `crates/codegen/` where the crate prefix is
 omitted. Prefer keeping new behavior in the isolated modules above and central

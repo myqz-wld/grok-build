@@ -1,8 +1,25 @@
-use super::support::create_test_actor_ex;
+use super::support::{create_test_actor_ex, test_agent_with_tools};
 use super::*;
 
+async fn install_mixed_file_toolset(actor: &SessionActor) {
+    use xai_grok_tools::implementations::grok_build::{
+        GrepTool, ListDirTool, ReadFileTool, SearchReplaceTool,
+    };
+    use xai_grok_tools::registry::types::ToolConfig;
+
+    actor.agent.replace(
+        test_agent_with_tools(vec![
+            ToolConfig::for_tool::<ReadFileTool>(),
+            ToolConfig::for_tool::<GrepTool>(),
+            ToolConfig::for_tool::<ListDirTool>(),
+            ToolConfig::for_tool::<SearchReplaceTool>(),
+        ])
+        .await,
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn annotation_actor_exposes_no_turn_capabilities() {
+async fn annotation_actor_exposes_only_local_read_only_file_tools() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -11,6 +28,7 @@ async fn annotation_actor_exposes_no_turn_capabilities() {
             let (mut actor, _event_rx) =
                 create_test_actor_ex(0, 128_000, 90, gateway_tx, persistence_tx).await;
             actor.startup_hints.actor_policy = SessionActorPolicy::Annotation;
+            install_mixed_file_toolset(&actor).await;
             actor.supports_backend_search.set(true);
             actor.memory.initial_injection_config.enabled = true;
 
@@ -20,16 +38,39 @@ async fn annotation_actor_exposes_no_turn_capabilities() {
             )
             .await
             .expect("annotation policy must bypass blocking MCP initialization");
-            assert!(definitions.is_empty());
             assert_eq!(wait_ms, 0);
-            assert!(
-                actor
-                    .turn_base_tool_specs(&[ToolDefinition::function(
-                        "dangerous",
+            let names = definitions
+                .iter()
+                .map(|definition| definition.function.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                names,
+                std::collections::BTreeSet::from(["grep", "list_dir", "read_file"])
+            );
+
+            let supplied = ["read_file", "bash", "search_replace", "unknown"]
+                .into_iter()
+                .map(|name| {
+                    ToolDefinition::function(
+                        name,
                         None::<&str>,
                         serde_json::json!({ "type": "object" }),
-                    )])
-                    .is_empty()
+                    )
+                })
+                .collect::<Vec<_>>();
+            let turn_names = actor
+                .turn_base_tool_specs(&supplied)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>();
+            assert_eq!(turn_names, ["read_file"]);
+
+            assert!(!actor.startup_hints.actor_policy.allows_mcp_tools());
+            assert!(
+                !actor
+                    .startup_hints
+                    .actor_policy
+                    .allows_local_tool_kind(xai_grok_tools::types::tool::ToolKind::Execute)
             );
             assert!(!actor.backend_search_active());
             assert!(!actor.startup_hints.actor_policy.allows_memory());
@@ -62,27 +103,85 @@ async fn annotation_actor_rejects_unexpected_tool_calls_before_dispatch() {
             let (mut actor, mut event_rx) =
                 create_test_actor_ex(0, 128_000, 90, gateway_tx, persistence_tx).await;
             actor.startup_hints.actor_policy = SessionActorPolicy::Annotation;
+            install_mixed_file_toolset(&actor).await;
 
             let err = actor
                 .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
                     id: "call-1".into(),
                     kind: "function".into(),
                     function: crate::sampling::types::ToolCallFunction::new(
-                        "bash",
-                        r#"{"cmd":"touch nope"}"#,
+                        "search_replace",
+                        r#"{"file_path":"nope","old_string":"a","new_string":"b"}"#,
                     ),
                 }])
                 .await
                 .unwrap_err();
 
             assert_eq!(err.code, acp::Error::invalid_request().code);
-            assert!(format!("{err:?}").contains("annotation sessions cannot dispatch"));
+            assert!(
+                format!("{err:?}")
+                    .contains("annotation sessions may only dispatch local read-only file tools")
+            );
             assert!(
                 matches!(
                     event_rx.try_recv(),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty)
                 ),
                 "no tool lifecycle event should be emitted before policy rejection"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn annotation_actor_dispatches_registered_read_file_tool() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let temp = tempfile::tempdir().expect("temp read directory");
+            let path = temp.path().join("annotation-context.txt");
+            std::fs::write(&path, "context available to annotation\n").expect("write read fixture");
+
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mut actor, _event_rx) =
+                create_test_actor_ex(0, 128_000, 90, gateway_tx, persistence_tx).await;
+            actor.startup_hints.actor_policy = SessionActorPolicy::Annotation;
+            install_mixed_file_toolset(&actor).await;
+            actor
+                .workspace_ops
+                .bind_local_session(
+                    &actor.session_id_string(),
+                    actor.tool_context.cwd.as_path().to_path_buf(),
+                    actor.tool_context.hunk_tracker_handle.clone(),
+                    actor.agent.borrow().tool_bridge().toolset(),
+                    None,
+                )
+                .expect("bind annotation read toolset");
+
+            let outcome = actor
+                .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
+                    id: "call-read".into(),
+                    kind: "function".into(),
+                    function: crate::sampling::types::ToolCallFunction::new(
+                        "read_file",
+                        serde_json::json!({ "target_file": path }).to_string(),
+                    ),
+                }])
+                .await
+                .expect("registered annotation reader should dispatch");
+            assert!(matches!(outcome, ToolLoop::Continue));
+
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let result = conversation.iter().rev().find_map(|item| match item {
+                ConversationItem::ToolResult(result) if result.tool_call_id == "call-read" => {
+                    Some(result.content.as_ref())
+                }
+                _ => None,
+            });
+            assert!(
+                result.is_some_and(|text| text.contains("context available to annotation")),
+                "read result should be returned to the annotation model: {conversation:?}"
             );
         })
         .await;

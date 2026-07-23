@@ -224,8 +224,9 @@ delete the parent-side card record. Expansion changes only through the explicit
 drag-selected and copied; `Alt+A`, or right-clicking inside that held selection
 and choosing **Annotate selection**, routes the resulting question as a
 follow-up in the same child session. The hidden child inherits conversation
-history only through the selected message's turn and runs without tools,
-backend search, or memory injection. Annotation text does not enter the parent
+history only through the selected message's turn. It can read, search, and list
+local project files, but cannot edit files, run commands, use MCP or network
+tools, or access memory injection. Annotation text does not enter the parent
 model context, transcript export, or search.
 
 If child creation fails, the draft card offers **retry** and **dismiss**. If

@@ -1077,7 +1077,7 @@ impl SessionActor {
     }
     /// Ensure MCP tools are initialized (spawns processes and performs handshakes on first call)
     pub(super) async fn ensure_mcp_tools_initialized(&self) {
-        if !self.startup_hints.actor_policy.allows_tools() {
+        if !self.startup_hints.actor_policy.allows_mcp_tools() {
             return;
         }
         let (mcp_server_configs, meta_config_map, generation, existing_client_names, has_acp) = {

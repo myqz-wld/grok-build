@@ -607,8 +607,33 @@ impl SessionActorPolicy {
         }
     }
 
-    pub(crate) fn allows_tools(self) -> bool {
+    /// Whether this actor may initialize or dispatch MCP-backed tools.
+    ///
+    /// Annotation actors deliberately bypass MCP initialization even though
+    /// they may use the bounded local file readers admitted by
+    /// [`Self::allows_local_tool_kind`].
+    pub(crate) fn allows_mcp_tools(self) -> bool {
         matches!(self, Self::Standard)
+    }
+
+    /// Whether a registered local tool kind is visible to this actor.
+    ///
+    /// Annotation sessions get only the file-oriented read surface needed to
+    /// inspect project context. Network reads, memory, control-flow tools, and
+    /// tools that merely claim to be read-only under another kind stay hidden.
+    pub(crate) fn allows_local_tool_kind(
+        self,
+        kind: xai_grok_tools::types::tool::ToolKind,
+    ) -> bool {
+        use xai_grok_tools::types::tool::ToolKind;
+
+        match self {
+            Self::Standard => true,
+            Self::Annotation => matches!(
+                kind,
+                ToolKind::Read | ToolKind::Search | ToolKind::ListDir | ToolKind::List
+            ),
+        }
     }
 
     pub(crate) fn allows_hooks(self) -> bool {

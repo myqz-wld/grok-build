@@ -24,7 +24,7 @@ The implementation must preserve these invariants:
 3. Resize, rewrap, scrolling, and parent-session reload must not silently move an annotation to different source text.
 4. A new annotation child inherits context only through the selected message's containing prompt turn; later parent turns are excluded.
 5. Follow-ups reuse the same child session and append to the same annotation thread.
-6. Annotation children are hidden from ordinary history/dashboard listings and cannot execute any local, MCP, web-search, structured-output, or other tool.
+6. Annotation children are hidden from ordinary history/dashboard listings and can execute only registered local file read/search/list tools; mutation, commands, MCP, network, memory, and structured-output tools remain blocked.
 7. `main` remains a clean upstream mirror. All implementation happens in an isolated worktree on `feature/inline-annotations`.
 8. The first release changes only the standard TUI. `--minimal` behavior remains unchanged.
 
@@ -33,7 +33,7 @@ The implementation must preserve these invariants:
 | ID | Decision | Status | Rationale |
 | --- | --- | --- | --- |
 | D1 | Fork context ends at the selected text's containing prompt turn. | Confirmed by user (`按推荐`) | Prevents later conversation from biasing a historical side discussion. |
-| D2 | Annotation sessions have a runtime-enforced zero-tool policy. | Confirmed by user (`按推荐`) | A historical explanation must not mutate the repository or initiate external actions. |
+| D2 | Annotation sessions have a runtime-enforced local file read-only tool policy. | Updated by user (2026-07-23) | A historical explanation may inspect other project files, but must not mutate the repository or initiate external actions. |
 | D3 | V1 supports the standard TUI only; `--minimal` is unchanged. | Confirmed by user (`按推荐`) | Keeps the first vertical slice bounded while preserving future-compatible data structures. |
 | D4 | V1 selection must remain within one completed User or Assistant message. | Confirmed as part of the recommended scope | Cross-message anchors and partial streaming entries introduce ambiguous context and line ownership. |
 | D5 | Right-click is supported where terminal mouse events arrive; `Alt+A` is the canonical portable shortcut. | Confirmed as part of the recommended scope | Some terminal emulators reserve or intercept right-click. |
@@ -65,14 +65,14 @@ The implementation must preserve these invariants:
   - `session_kind="annotation"` plus `hidden=true` is therefore compatible with existing storage/listing semantics.
 - Existing `/fork` client orchestration already covers fork, load, and first prompt, but it routes the child as the active top-level session. Annotation flow needs a hidden-session target and must leave the parent active.
 
-### 4.3 Runtime no-tool boundary
+### 4.3 Runtime read-only boundary
 
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs`
   - `prepare_tool_definitions_*` is the common built-in/MCP definition path.
 - `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs`
   - `process_conversation_turn` builds the effective tool list and separately considers backend search and structured-output tools.
-- A persisted actor capability must gate all of these paths. An empty prompt-level instruction alone is insufficient.
-- The actor mode should be derived from the persisted summary/session kind during load, not only from client-provided metadata, so manually reloading an annotation child cannot re-enable tools.
+- A persisted actor capability must gate all of these paths. A prompt-level instruction alone is insufficient.
+- The actor mode should be derived from the persisted summary/session kind during load, not only from client-provided metadata, so manually reloading an annotation child cannot broaden its tool access.
 
 ### 4.4 Reusable UI patterns
 
@@ -214,7 +214,7 @@ The application is solely responsible for:
 - validating selection eligibility;
 - converting screen coordinates into semantic line ranges;
 - selecting `target_prompt_index`;
-- forking and marking the child hidden/annotation/no-tools;
+- forking and marking the child hidden/annotation/read-only;
 - routing stream notifications;
 - persisting/folding annotation events;
 - validating anchors on replay;
@@ -269,7 +269,7 @@ Acceptance: round-trip, partial-last-line recovery, delete tombstone, duplicate 
 - Add persisted actor capability for annotation sessions.
 - Gate tool definitions, backend search, structured-output tool, memory injection, and unexpected tool dispatch.
 
-Acceptance: copied history ends at selected prompt index; summary is hidden/kind annotation; request snapshots contain no tools/backend search; forced synthetic tool-call cannot dispatch.
+Acceptance: copied history ends at selected prompt index; summary is hidden/kind annotation; request snapshots contain only local file readers and no backend search; forced mutating, command, MCP, or unknown tool calls cannot dispatch.
 
 ### T5 — Hidden annotation orchestration
 
@@ -427,7 +427,7 @@ Manual smoke test in a standard TUI:
   - T1 `770e449c-8332-4967-9a2e-204c60cea06a` — isolate worktree;
   - T2 `eadf1639-fa6b-4190-a561-fcfe0ec69751` — semantic lines and anchors;
   - T3 `d679fb1a-e4a6-4bbe-b942-e1bc9113307f` — annotation storage;
-  - T4 `b05ed15c-e0ef-4b3b-8749-b1fdf997dfbc` — hidden no-tool forks;
+  - T4 `b05ed15c-e0ef-4b3b-8749-b1fdf997dfbc` — hidden capability-restricted forks;
   - T5 `2affc384-0421-4084-8f26-8a3c0cb18f5e` — session routing;
   - T6 `07bc7bd0-d4f5-4c3d-a753-c23684a1fd24` — standard TUI;
   - T7 `2c986083-0c0d-42d8-bc09-a09b3fc809ee` — validation/docs;
@@ -446,8 +446,8 @@ Manual smoke test in a standard TUI:
 - T4 completion (2026-07-22):
   - annotation forks now require a prompt cutoff, persist `session_kind=annotation` plus `hidden=true`, and skip plan/mode/signals/tool/announcement/compaction-archive state;
   - actor capability policy is derived from the persisted summary on load and cannot be supplied through ACP startup metadata;
-  - annotation requests expose no built-in/MCP tools, hosted search, memory context, or native/pseudo-tool structured output; MCP reminders and hook dispatch are also suppressed;
-  - any unexpected model tool call is rejected with an ACP protocol error before tool lifecycle events or dispatch;
+  - annotation requests originally exposed no tools; on 2026-07-23 this was narrowed to registered local file read/search/list tools, while MCP, mutation, commands, hosted search, memory context, and native/pseudo-tool structured output remain suppressed;
+  - any model call outside that read-only allowlist is rejected with an ACP protocol error before tool lifecycle events or dispatch;
   - focused fork/cutoff/hidden-state and actor-policy tests pass (6 tests at completion), and `cargo check -p xai-grok-shell` passes.
 - T5 completion (2026-07-22):
   - added parent-owned annotation runtime state, strict FIFO event persistence, lazy hidden-child loading, and one-in-flight exchange enforcement per thread;

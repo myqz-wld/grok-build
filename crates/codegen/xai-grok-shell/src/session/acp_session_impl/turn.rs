@@ -2013,10 +2013,12 @@ impl SessionActor {
                 "backend_search: turn tool resolution"
             );
             let mut effective_tools: Vec<ToolSpec> =
-                if !self.startup_hints.actor_policy.allows_tools() {
-                    Vec::new()
-                } else if let Some(ref override_tools) = self.forked_tool_override {
-                    override_tools.clone()
+                if let Some(ref override_tools) = self.forked_tool_override {
+                    override_tools
+                        .iter()
+                        .filter(|tool| self.actor_policy_allows_tool(&tool.name))
+                        .cloned()
+                        .collect()
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
                 };
