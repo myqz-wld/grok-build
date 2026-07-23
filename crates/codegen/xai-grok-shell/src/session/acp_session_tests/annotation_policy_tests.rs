@@ -31,7 +31,7 @@ async fn annotation_actor_exposes_no_turn_capabilities() {
                     )])
                     .is_empty()
             );
-            assert!(!actor.backend_search_allowed());
+            assert!(!actor.backend_search_active());
             assert!(!actor.startup_hints.actor_policy.allows_memory());
             assert_eq!(
                 actor

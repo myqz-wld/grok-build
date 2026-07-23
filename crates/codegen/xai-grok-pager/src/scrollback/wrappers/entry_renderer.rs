@@ -1238,7 +1238,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // UserPrompt has vpad=true, first content row is y=1.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
         let content_row = 1u16;
@@ -1263,7 +1263,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // AgentMessage has vpad=false, first content row is y=0.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
 
@@ -1290,7 +1290,14 @@ mod tests {
         let mut buf = Buffer::empty(area);
         renderer.render(area, &mut buf);
 
-        let expected = chrono::Local::now().format("%H:%M:%S | %b %d").to_string();
+        // Compare against the entry's captured timestamp, not a fresh
+        // Local::now() — re-sampling the clock here races the second boundary
+        // (%H:%M:%S) and made this test flaky.
+        let expected = entry
+            .created_at
+            .unwrap()
+            .format("%H:%M:%S | %b %d")
+            .to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
 
@@ -1517,7 +1524,7 @@ mod tests {
         renderer.render(area, &mut buf);
 
         // AgentMessage has no vpad → first content row is y=0.
-        let expected = chrono::Local::now().format("%-I:%M %p").to_string();
+        let expected = entry.created_at.unwrap().format("%-I:%M %p").to_string();
         let ts_width = expected.len() as u16;
         let ts_x = width - 2 - ts_width;
         let rendered = collect_row_symbols(&buf, 0, ts_x, ts_x + ts_width);

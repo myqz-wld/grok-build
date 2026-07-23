@@ -336,6 +336,26 @@ shell validation is no worse than the recorded `main@ba76b0a` baseline; the fix 
 committed and pushed on `fix/inline-annotations-review`, then fast-forwarded and
 pushed to `feature/inline-annotations`; pristine `main` remains unchanged.
 
+### T9 — Sync the reviewed downstream build with current upstream
+
+Merge the latest fetched `upstream/main` into the reviewed downstream line in an
+isolated worktree, preserving both the annotation invariants above and all new
+upstream behavior. Resolve central TUI, session-policy, lifecycle-hook, and
+backend-search conflicts semantically rather than choosing either side wholesale.
+
+Validate focused annotation source mapping, routing, persistence, cancellation,
+render caching, and actor-policy coverage; then run formatting, pager-bin checking,
+the complete pager and shell suites, release build, and standard/minimal startup
+smokes. Compare any failures with a clean checkout of the exact upstream commit or
+prove that the failing paths are unchanged from it. Commit and push the merge on a
+temporary sync branch, fast-forward `downstream/main` without force, install the
+resulting release binary locally with a recoverable backup, and leave pristine
+`main` at `ba76b0a`.
+
+Acceptance: `downstream/main` contains current upstream plus the reviewed annotation
+feature, the installed `grok` reports the merged build, focused regressions pass,
+all non-baseline validation passes, and pristine `main` is unchanged.
+
 ## 9. Validation plan
 
 Run the narrowest tests during development, then:
@@ -507,5 +527,40 @@ Manual smoke test in a standard TUI:
   fast-forwarded and pushed to the same commit without force, both branches are
   retained, the isolated remediation worktree is removed, and the primary
   repository remains pristine on `main@ba76b0a`.
-- Current state: T8 is complete; no implementation, validation, review, or
-  delivery work remains.
+- T9 upstream sync start (2026-07-22):
+  - created isolated worktree
+    `/Users/wanglidong/Repository/grok-build-worktrees/upstream-sync-20260722`
+    on `sync/upstream-20260722` from reviewed `downstream/main@44d38cc`;
+  - fetched and merged `upstream/main@a5727c5` (`grok` 0.2.110), resolving nine
+    conflicts while retaining upstream workflows, background/task/external-editor
+    shortcuts, overlays, and backend-search APIs together with annotation entry,
+    rendering, zero-capability policy, and lifecycle-hook gates;
+  - migrated the removed session-existence helper to the upstream persistence
+    lookup without changing hidden-child semantics;
+  - focused results pass: 46 pager annotation tests, 8 shell annotation-policy
+    tests, 472 Markdown tests, 9 durable turn-completion tests, 11 session-routing
+    tests, and the 4,096-source-span scaling regression;
+  - `cargo fmt --all -- --check`, `cargo check -p xai-grok-pager-bin`, and
+    `git diff --check` pass;
+  - the complete pager lib run is 7753 passed / 11 failed / 10 ignored. A clean
+    detached `upstream/main@a5727c5` run reproduces the exact same 11 failures
+    (7697 passed / 11 failed / 10 ignored), proving the theme, token-color,
+    cursor, and macOS `Opt+Enter` expectations are upstream baseline;
+  - the complete shell run, with a larger test-thread stack to avoid an unchanged
+    upstream test-harness overflow, is 5734 passed / 27 failed / 13 ignored in
+    the lib target; every integration target and doctest completes without an
+    additional failure. Twenty-three failures are the upstream
+    `jsonwebtoken` CryptoProvider test-feature conflict; the remaining four are
+    unchanged Claude-import, file-watcher, symlink-count, and macOS `/private`
+    path expectations. The failing production/test paths are unchanged from
+    `upstream/main` (the JSONL test file only has an unrelated annotation test
+    appended after the failing upstream test);
+  - `cargo build -p xai-grok-pager-bin --release` passes and produces a 0.2.110
+    binary; ignored PTY checks pass for standard welcome-screen launch/quit and
+    minimal-mode first/second Ctrl+C confirmation/quit. A transient PTY compile
+    error was traced to same-target Cargo artifacts from the detached upstream
+    baseline comparison and disappeared after cleaning only the affected
+    Markdown/PTY-harness package artifacts;
+  - merge delivery and local installation remain.
+- Current state: T8 is complete and T9 validation is in progress; pristine
+  `main` remains at `ba76b0a`.

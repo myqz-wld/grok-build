@@ -169,6 +169,10 @@ impl SessionActor {
     }
 
     pub(super) async fn handle_completion(&self, prompt_id: String, result: PromptTurnResult) {
+        let result = result.map(|mut ok| {
+            ok.tool_overrides = self.effective_tool_overrides();
+            ok
+        });
         let became_idle = {
             let mut current_prompt_id = self
                 .current_prompt_id
@@ -411,7 +415,10 @@ impl SessionActor {
                     | crate::session::commands::PromptCompletionKind::MaxTurnsReached { .. }
             )
         });
-        let turn_succeeded = result.is_ok() && !turn_cancelled;
+        let turn_succeeded = result
+            .as_ref()
+            .ok()
+            .is_some_and(|ok| !turn_cancelled && ok.stop_reason != acp::StopReason::Refusal);
         let infra_pause_message = result
             .as_ref()
             .err()
