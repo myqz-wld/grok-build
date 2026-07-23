@@ -15,11 +15,20 @@ use crate::theme::Theme;
 use crate::views::prompt_widget::{PromptRenderResult, PromptStyle, PromptWidget};
 
 pub(crate) const ANNOTATION_COMPOSER_DECORATION_ID: &str = "__annotation_composer__";
+pub(crate) const ANNOTATION_COMPOSER_INPUT_ACTION: &str = "__annotation_composer_input__";
 
 #[derive(Debug)]
 pub(crate) enum AnnotationComposerTarget {
-    New { anchor: AnnotationAnchor },
-    FollowUp { thread_id: ThreadId },
+    New {
+        anchor: AnnotationAnchor,
+    },
+    FollowUp {
+        thread_id: ThreadId,
+        /// Existing annotation-card row after which the inline editor belongs.
+        /// `None` is used by the card's generic follow-up action and places the
+        /// editor below the complete card.
+        after_card_row: Option<usize>,
+    },
 }
 
 impl AnnotationComposerTarget {

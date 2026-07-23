@@ -1537,7 +1537,15 @@ impl AgentView {
                 .find(|placement| {
                     placement.id == crate::views::annotation::ANNOTATION_COMPOSER_DECORATION_ID
                 })
-                .map(|placement| placement.area);
+                .map(|placement| placement.area)
+                .or_else(|| {
+                    sb_output.decorations.iter().find_map(|placement| {
+                        placement.buttons.iter().find_map(|(action, area)| {
+                            (action == crate::views::annotation::ANNOTATION_COMPOSER_INPUT_ACTION)
+                                .then_some(*area)
+                        })
+                    })
+                });
             self.annotation_ui.card_placements = sb_output
                 .decorations
                 .iter()
@@ -1545,6 +1553,12 @@ impl AgentView {
                     placement.id != crate::views::annotation::ANNOTATION_COMPOSER_DECORATION_ID
                 })
                 .cloned()
+                .map(|mut placement| {
+                    placement.buttons.retain(|(action, _)| {
+                        action != crate::views::annotation::ANNOTATION_COMPOSER_INPUT_ACTION
+                    });
+                    placement
+                })
                 .collect();
             self.update_scrollback_selection_state(
                 sb_output.selection_model.clone(),

@@ -22,10 +22,11 @@ use crate::scrollback::{
 };
 use crate::theme::Theme;
 use crate::views::annotation::{
-    ANNOTATION_COMPOSER_DECORATION_ID, ActiveAnnotationCardTextDrag, AnnotationCardAction,
-    AnnotationCardBodyCache, AnnotationCardBodyCacheKey, AnnotationCardTextPoint,
-    AnnotationCardTextSelection, AnnotationComposerState, AnnotationComposerTarget,
-    AnnotationContextMenuState, PendingAnnotationCardTextDrag,
+    ANNOTATION_COMPOSER_DECORATION_ID, ANNOTATION_COMPOSER_INPUT_ACTION,
+    ActiveAnnotationCardTextDrag, AnnotationCardAction, AnnotationCardBodyCache,
+    AnnotationCardBodyCacheKey, AnnotationCardTextPoint, AnnotationCardTextSelection,
+    AnnotationComposerState, AnnotationComposerTarget, AnnotationContextMenuState,
+    PendingAnnotationCardTextDrag,
 };
 use crate::views::prompt_widget::PromptEvent;
 
@@ -48,13 +49,16 @@ impl AgentView {
         if crate::app::minimal_mode_active() {
             return InputOutcome::Unchanged;
         }
-        if let Some(thread_id) = self
+        if let Some((thread_id, after_card_row)) = self
             .annotation_ui
             .card_text_selection
             .as_ref()
-            .map(|selection| selection.thread_id)
+            .map(|selection| {
+                let (_, end) = ordered_annotation_card_points(selection.anchor, selection.head);
+                (selection.thread_id, end.row)
+            })
         {
-            return self.open_annotation_follow_up(thread_id);
+            return self.open_annotation_follow_up_at(thread_id, Some(after_card_row));
         }
         match self.selected_annotation_anchor() {
             Ok(anchor) => {
@@ -75,6 +79,14 @@ impl AgentView {
     }
 
     fn open_annotation_follow_up(&mut self, thread_id: ThreadId) -> InputOutcome {
+        self.open_annotation_follow_up_at(thread_id, None)
+    }
+
+    fn open_annotation_follow_up_at(
+        &mut self,
+        thread_id: ThreadId,
+        after_card_row: Option<usize>,
+    ) -> InputOutcome {
         if let Some(message) = self.annotation_storage_unavailable() {
             self.show_toast(&message);
             return InputOutcome::Changed;
@@ -95,8 +107,16 @@ impl AgentView {
             self.show_toast("This annotation is already answering a question");
             return InputOutcome::Changed;
         }
-        self.annotation_ui.expanded_threads.insert(thread_id);
-        self.open_annotation_composer(AnnotationComposerTarget::FollowUp { thread_id });
+        // The generic follow-up action belongs below the complete expanded
+        // card. A text-selection follow-up must preserve the card's current
+        // shape so its captured row continues to identify the selected line.
+        if after_card_row.is_none() {
+            self.annotation_ui.expanded_threads.insert(thread_id);
+        }
+        self.open_annotation_composer(AnnotationComposerTarget::FollowUp {
+            thread_id,
+            after_card_row,
+        });
         InputOutcome::Changed
     }
 
@@ -257,9 +277,10 @@ impl AgentView {
                 self.open_annotation_composer(AnnotationComposerTarget::New { anchor });
                 InputOutcome::Changed
             }
-            AnnotationComposerTarget::FollowUp { thread_id } => {
-                self.open_annotation_follow_up(thread_id)
-            }
+            AnnotationComposerTarget::FollowUp {
+                thread_id,
+                after_card_row,
+            } => self.open_annotation_follow_up_at(thread_id, after_card_row),
         }
     }
 
@@ -614,6 +635,11 @@ impl AgentView {
         self.annotation_ui.context_menu = Some(AnnotationContextMenuState::new(
             AnnotationComposerTarget::FollowUp {
                 thread_id: selection.thread_id,
+                after_card_row: Some(
+                    ordered_annotation_card_points(selection.anchor, selection.head)
+                        .1
+                        .row,
+                ),
             },
             column,
             row,
@@ -721,11 +747,17 @@ impl AgentView {
                     )),
                     AnnotationComposerTarget::FollowUp { .. } => None,
                 });
-        let follow_up_composer_thread = self
-            .annotation_ui
-            .composer
-            .as_ref()
-            .and_then(|composer| composer.target.thread_id());
+        let follow_up_composer =
+            self.annotation_ui
+                .composer
+                .as_ref()
+                .and_then(|composer| match &composer.target {
+                    AnnotationComposerTarget::FollowUp {
+                        thread_id,
+                        after_card_row,
+                    } => Some((*thread_id, *after_card_row)),
+                    AnnotationComposerTarget::New { .. } => None,
+                });
         let mut decorations = Vec::new();
 
         // A new annotation editor is the first decoration after the selected
@@ -813,6 +845,12 @@ impl AgentView {
             } else {
                 usize::MAX
             };
+            let composer_after_card_row =
+                follow_up_composer.and_then(|(composer_thread_id, after_card_row)| {
+                    (composer_thread_id == *thread_id)
+                        .then_some(after_card_row)
+                        .flatten()
+                });
             decorations.push(build_thread_card_with_body(
                 thread,
                 entry_id,
@@ -824,10 +862,13 @@ impl AgentView {
                 body,
                 content_revision,
                 theme_revision,
+                composer_after_card_row,
                 &theme,
             ));
-            // Follow-up editors belong immediately below their owning card.
-            if follow_up_composer_thread == Some(*thread_id) {
+            // The generic follow-up action belongs immediately below its
+            // owning card. Selection-created editors are embedded inside the
+            // card directly after the selected row.
+            if follow_up_composer == Some((*thread_id, None)) {
                 decorations.push(build_inline_composer_decoration(
                     &thread.anchor.selected_text_hash,
                     entry_id,
@@ -1099,6 +1140,7 @@ fn build_thread_card(
         body,
         0,
         annotation_theme_revision(theme),
+        None,
         theme,
     )
 }
@@ -1115,6 +1157,7 @@ fn build_thread_card_with_body(
     body: Vec<Line<'static>>,
     content_revision: u64,
     theme_revision: u64,
+    composer_after_card_row: Option<usize>,
     theme: &Theme,
 ) -> ScrollbackDecoration {
     let status = thread_status(thread, active);
@@ -1135,7 +1178,7 @@ fn build_thread_card_with_body(
     }
     let id = thread.thread_id.to_string();
     let action_rows = card_action_rows(&id, &actions, width, expanded, hovered, theme);
-    build_card(
+    let mut card = build_card(
         id,
         &thread.anchor,
         entry_id,
@@ -1151,9 +1194,55 @@ fn build_thread_card_with_body(
             expanded,
             active,
             hovered,
+            composer_after_card_row,
         ),
         theme,
-    )
+    );
+    if let Some(after_card_row) = composer_after_card_row {
+        insert_inline_composer_row(&mut card, after_card_row, width, theme);
+    }
+    card
+}
+
+fn insert_inline_composer_row(
+    card: &mut ScrollbackDecoration,
+    after_card_row: usize,
+    width: u16,
+    theme: &Theme,
+) {
+    let fallback_row = card
+        .lines
+        .iter()
+        .rposition(|line| line.selectable.is_some())
+        .unwrap_or(0);
+    let anchored_row = card
+        .lines
+        .get(after_card_row)
+        .is_some_and(|line| line.selectable.is_some())
+        .then_some(after_card_row)
+        .unwrap_or(fallback_row);
+    let insertion_row = anchored_row.saturating_add(1).min(card.lines.len());
+    for button in &mut card.buttons {
+        if button.row >= insertion_row {
+            button.row = button.row.saturating_add(1);
+        }
+    }
+    card.lines.insert(
+        insertion_row,
+        DecorationLine::new(
+            Line::from(Span::styled(
+                "│  ",
+                Style::default().fg(theme.accent_user).bg(theme.bg_visual),
+            )),
+            theme.bg_visual,
+        ),
+    );
+    card.buttons.push(DecorationButton {
+        row: insertion_row,
+        col: 0,
+        width,
+        action: ANNOTATION_COMPOSER_INPUT_ACTION.into(),
+    });
 }
 
 fn build_thread_card_body(
@@ -1457,6 +1546,7 @@ fn revision_for_thread(
     expanded: bool,
     active: bool,
     hovered: Option<&(String, String)>,
+    composer_after_card_row: Option<usize>,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     thread_id.hash(&mut hasher);
@@ -1466,6 +1556,7 @@ fn revision_for_thread(
     expanded.hash(&mut hasher);
     active.hash(&mut hasher);
     hovered.hash(&mut hasher);
+    composer_after_card_row.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1811,7 +1902,10 @@ mod tests {
                 .context_menu
                 .as_ref()
                 .map(|menu| &menu.target),
-            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+            Some(AnnotationComposerTarget::FollowUp {
+                thread_id: id,
+                after_card_row: Some(2),
+            }) if *id == thread_id
         ));
         assert!(matches!(
             agent.activate_annotation_context_menu(),
@@ -1823,7 +1917,10 @@ mod tests {
                 .composer
                 .as_ref()
                 .map(|composer| &composer.target),
-            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+            Some(AnnotationComposerTarget::FollowUp {
+                thread_id: id,
+                after_card_row: Some(2),
+            }) if *id == thread_id
         ));
 
         agent.annotation_ui.composer = None;
@@ -1837,7 +1934,10 @@ mod tests {
                 .composer
                 .as_ref()
                 .map(|composer| &composer.target),
-            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+            Some(AnnotationComposerTarget::FollowUp {
+                thread_id: id,
+                after_card_row: Some(2),
+            }) if *id == thread_id
         ));
     }
 
@@ -1893,6 +1993,88 @@ mod tests {
             Some(ANNOTATION_COMPOSER_DECORATION_ID)
         );
         assert_eq!(decorations[card_index + 1].row_count(), 1);
+    }
+
+    #[test]
+    fn selection_follow_up_composer_is_directly_below_selected_card_row() {
+        let thread = completed_thread();
+        let thread_id = thread.thread_id;
+        let mut agent = agent_with_thread_card(thread);
+        agent.sync_annotation_decorations(80);
+        let (selected_row, selectable_revision) = {
+            let card = agent
+                .scrollback
+                .decoration_map()
+                .values()
+                .flatten()
+                .find(|decoration| decoration.id == thread_id.to_string())
+                .expect("thread card");
+            let selected_row = card
+                .lines
+                .iter()
+                .position(|line| line.selectable.is_some())
+                .expect("selectable card body row");
+            (
+                selected_row,
+                crate::scrollback::decorations::selectable_revision(card),
+            )
+        };
+        agent.annotation_ui.card_text_selection = Some(AnnotationCardTextSelection {
+            thread_id,
+            selectable_revision,
+            anchor: AnnotationCardTextPoint {
+                row: selected_row,
+                col: 0,
+            },
+            head: AnnotationCardTextPoint {
+                row: selected_row,
+                col: 2,
+            },
+        });
+
+        assert!(matches!(
+            agent.open_annotation_composer_from_selection(),
+            InputOutcome::Changed
+        ));
+        assert!(matches!(
+            agent
+                .annotation_ui
+                .composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(AnnotationComposerTarget::FollowUp {
+                thread_id: id,
+                after_card_row: Some(row),
+            }) if *id == thread_id && *row == selected_row
+        ));
+        agent.sync_annotation_decorations(80);
+
+        let decorations: Vec<_> = agent
+            .scrollback
+            .decoration_map()
+            .values()
+            .flatten()
+            .collect();
+        assert!(
+            decorations
+                .iter()
+                .all(|decoration| decoration.id != ANNOTATION_COMPOSER_DECORATION_ID),
+            "selection follow-up must not create a standalone editor below the card"
+        );
+        let card = decorations
+            .iter()
+            .find(|decoration| decoration.id == thread_id.to_string())
+            .expect("thread card");
+        let marker = card
+            .buttons
+            .iter()
+            .find(|button| button.action == ANNOTATION_COMPOSER_INPUT_ACTION)
+            .expect("embedded composer placement marker");
+        assert_eq!(marker.row, selected_row + 1);
+        assert_eq!(
+            card.lines[marker.row].background,
+            Theme::current().bg_visual
+        );
     }
 
     #[test]
