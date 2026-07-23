@@ -7,7 +7,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::block::{BlockContent, RenderBlock};
-use super::decorations::{DecorationPlacement, EntryDecorationLayout, ScrollbackDecoration};
+use super::decorations::{
+    DecorationPlacement, DecorationSelectableLinePlacement, EntryDecorationLayout,
+    ScrollbackDecoration, selectable_revision,
+};
 use super::entry::{EntryId, ScrollbackEntry};
 use super::layout::HorizontalLayout;
 use super::state::EntryLayoutInfo;
@@ -1014,6 +1017,25 @@ fn render_scrolled_entries_impl(
                     })
                 })
                 .collect();
+            let selectable_lines = placement
+                .decoration
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(decoration_row, line)| {
+                    let selectable = line.selectable.as_ref()?;
+                    let row = decoration_start.saturating_add(decoration_row);
+                    if row < viewport_start || row >= viewport_end {
+                        return None;
+                    }
+                    Some(DecorationSelectableLinePlacement {
+                        row: decoration_row,
+                        screen_x: entry_row_layout.content.x.saturating_add(selectable.col),
+                        screen_y: viewport.y + (row - viewport_start) as u16,
+                        text: selectable.text.clone(),
+                    })
+                })
+                .collect();
             result.decorations.push(DecorationPlacement {
                 id: placement.decoration.id.clone(),
                 area,
@@ -1021,6 +1043,8 @@ fn render_scrolled_entries_impl(
                 bottom_clipped: decoration_end > viewport_end,
                 exact_anchor: placement.exact_anchor,
                 buttons,
+                selectable_lines,
+                selectable_revision: selectable_revision(placement.decoration),
             });
         }
 

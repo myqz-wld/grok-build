@@ -1,6 +1,7 @@
 //! Standard-TUI interaction and card projection for inline annotations.
 
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::{Modifier, Style};
@@ -21,15 +22,22 @@ use crate::scrollback::{
 };
 use crate::theme::Theme;
 use crate::views::annotation::{
-    AnnotationCardAction, AnnotationCardBodyCache, AnnotationCardBodyCacheKey,
-    AnnotationComposerState, AnnotationComposerTarget, AnnotationContextMenuState,
-    COMPOSER_CANCEL_ID, COMPOSER_SUBMIT_ID,
+    ANNOTATION_COMPOSER_DECORATION_ID, ActiveAnnotationCardTextDrag, AnnotationCardAction,
+    AnnotationCardBodyCache, AnnotationCardBodyCacheKey, AnnotationCardTextPoint,
+    AnnotationCardTextSelection, AnnotationComposerState, AnnotationComposerTarget,
+    AnnotationContextMenuState, PendingAnnotationCardTextDrag,
 };
-use crate::views::modal_window::{ModalWindowOutcome, handle_modal_mouse};
-use crate::views::prompt_widget::{EnterOutcome, PromptEvent};
+use crate::views::prompt_widget::PromptEvent;
 
 const CARD_PREFIX_WIDTH: usize = 3;
 const CARD_LABEL_WIDTH: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnnotationCardTextHit {
+    thread_id: ThreadId,
+    selectable_revision: u64,
+    point: AnnotationCardTextPoint,
+}
 
 impl AgentView {
     pub(crate) fn annotation_overlay_open(&self) -> bool {
@@ -39,6 +47,14 @@ impl AgentView {
     pub(crate) fn open_annotation_composer_from_selection(&mut self) -> InputOutcome {
         if crate::app::minimal_mode_active() {
             return InputOutcome::Unchanged;
+        }
+        if let Some(thread_id) = self
+            .annotation_ui
+            .card_text_selection
+            .as_ref()
+            .map(|selection| selection.thread_id)
+        {
+            return self.open_annotation_follow_up(thread_id);
         }
         match self.selected_annotation_anchor() {
             Ok(anchor) => {
@@ -54,6 +70,7 @@ impl AgentView {
 
     fn open_annotation_composer(&mut self, target: AnnotationComposerTarget) {
         self.annotation_ui.context_menu = None;
+        self.annotation_ui.composer_placement = None;
         self.annotation_ui.composer = Some(AnnotationComposerState::new(target, &self.session.cwd));
     }
 
@@ -78,9 +95,8 @@ impl AgentView {
             self.show_toast("This annotation is already answering a question");
             return InputOutcome::Changed;
         }
-        let anchor = thread.anchor.clone();
         self.annotation_ui.expanded_threads.insert(thread_id);
-        self.open_annotation_composer(AnnotationComposerTarget::FollowUp { thread_id, anchor });
+        self.open_annotation_composer(AnnotationComposerTarget::FollowUp { thread_id });
         InputOutcome::Changed
     }
 
@@ -92,8 +108,11 @@ impl AgentView {
         }
         match self.selected_annotation_anchor() {
             Ok(anchor) => {
-                self.annotation_ui.context_menu =
-                    Some(AnnotationContextMenuState::new(anchor, column, row));
+                self.annotation_ui.context_menu = Some(AnnotationContextMenuState::new(
+                    AnnotationComposerTarget::New { anchor },
+                    column,
+                    row,
+                ));
                 InputOutcome::Changed
             }
             Err(error) => {
@@ -119,7 +138,8 @@ impl AgentView {
                 }
                 crossterm::event::Event::Paste(text) => {
                     if let Some(composer) = self.annotation_ui.composer.as_mut() {
-                        composer.prompt.textarea.insert_str(text);
+                        let single_line = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                        composer.prompt.textarea.insert_str(&single_line);
                     }
                     InputOutcome::Changed
                 }
@@ -154,18 +174,18 @@ impl AgentView {
     fn handle_annotation_composer_key(&mut self, key: &KeyEvent) -> InputOutcome {
         if key.code == KeyCode::Esc && key.modifiers.is_empty() {
             self.annotation_ui.composer = None;
+            self.annotation_ui.composer_placement = None;
             return InputOutcome::Changed;
         }
-        let enter = self
+        let enter_submits = self
             .annotation_ui
             .composer
-            .as_mut()
-            .map(|composer| composer.prompt.route_enter(key))
-            .unwrap_or(EnterOutcome::PassThrough);
-        match enter {
-            EnterOutcome::NewlineInserted => return InputOutcome::Changed,
-            EnterOutcome::Submit => return self.submit_annotation_composer(),
-            EnterOutcome::PassThrough => {}
+            .as_ref()
+            .is_some_and(|composer| {
+                key.code == KeyCode::Enter && !composer.prompt.file_search_visible()
+            });
+        if enter_submits {
+            return self.submit_annotation_composer();
         }
         let event = self
             .annotation_ui
@@ -183,16 +203,18 @@ impl AgentView {
         let Some(composer) = self.annotation_ui.composer.as_mut() else {
             return InputOutcome::Unchanged;
         };
-        match handle_modal_mouse(&mut composer.window, mouse.kind, mouse.column, mouse.row) {
-            ModalWindowOutcome::CloseRequested
-            | ModalWindowOutcome::ShortcutActivated(COMPOSER_CANCEL_ID) => {
+        let inside = composer
+            .input_area
+            .is_some_and(|area| area.contains((mouse.column, mouse.row).into()));
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if !inside => {
                 self.annotation_ui.composer = None;
+                self.annotation_ui.composer_placement = None;
                 InputOutcome::Changed
             }
-            ModalWindowOutcome::ShortcutActivated(COMPOSER_SUBMIT_ID) => {
-                self.submit_annotation_composer()
-            }
-            ModalWindowOutcome::Unhandled => {
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left) => {
                 composer.prompt.handle_mouse(mouse);
                 InputOutcome::Changed
             }
@@ -201,19 +223,14 @@ impl AgentView {
     }
 
     fn submit_annotation_composer(&mut self) -> InputOutcome {
-        let Some(composer) = self.annotation_ui.composer.as_mut() else {
+        let Some(composer) = self.annotation_ui.composer.as_ref() else {
             return InputOutcome::Changed;
         };
         if composer.prompt.text().trim().is_empty() {
             self.show_toast("Enter a question for the selected text");
             return InputOutcome::Changed;
         }
-        let Some(question) = composer.prompt.try_send() else {
-            // A trailing backslash is the prompt widget's portable newline
-            // gesture. Keep the composer and its edited draft open.
-            return InputOutcome::Changed;
-        };
-        let question = question.trim().to_string();
+        let question = composer.prompt.text().trim().to_string();
         let composer = self
             .annotation_ui
             .composer
@@ -236,10 +253,15 @@ impl AgentView {
         let Some(menu) = self.annotation_ui.context_menu.take() else {
             return InputOutcome::Changed;
         };
-        self.open_annotation_composer(AnnotationComposerTarget::New {
-            anchor: menu.anchor,
-        });
-        InputOutcome::Changed
+        match menu.target {
+            AnnotationComposerTarget::New { anchor } => {
+                self.open_annotation_composer(AnnotationComposerTarget::New { anchor });
+                InputOutcome::Changed
+            }
+            AnnotationComposerTarget::FollowUp { thread_id } => {
+                self.open_annotation_follow_up(thread_id)
+            }
+        }
     }
 
     fn handle_annotation_context_menu_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
@@ -276,53 +298,328 @@ impl AgentView {
         if crate::app::minimal_mode_active() || self.annotation_overlay_open() {
             return None;
         }
-        if mouse.kind == MouseEventKind::Moved {
-            let hovered = self
-                .annotation_ui
-                .card_placements
-                .iter()
-                .find_map(|placement| {
-                    placement.buttons.iter().find_map(|(action, area)| {
-                        area.contains((mouse.column, mouse.row).into())
-                            .then(|| (placement.id.clone(), action.clone()))
-                    })
-                });
-            if hovered != self.annotation_ui.hovered_card_button {
-                self.annotation_ui.hovered_card_button = hovered;
-                return Some(InputOutcome::Changed);
+        match mouse.kind {
+            MouseEventKind::Moved => {
+                let hovered = self
+                    .annotation_ui
+                    .card_placements
+                    .iter()
+                    .find_map(|placement| {
+                        placement.buttons.iter().find_map(|(action, area)| {
+                            area.contains((mouse.column, mouse.row).into())
+                                .then(|| (placement.id.clone(), action.clone()))
+                        })
+                    });
+                if hovered != self.annotation_ui.hovered_card_button {
+                    self.annotation_ui.hovered_card_button = hovered;
+                    return Some(InputOutcome::Changed);
+                }
+                None
             }
-            return None;
+            MouseEventKind::Down(MouseButton::Left) => {
+                let button = self
+                    .annotation_ui
+                    .card_placements
+                    .iter()
+                    .find_map(|placement| {
+                        placement
+                            .buttons
+                            .iter()
+                            .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
+                            .map(|(action, _)| (placement.id.clone(), action.clone()))
+                    });
+                if let Some((id, action)) = button {
+                    self.persistent_text_selection = None;
+                    self.table_selection_geometry = None;
+                    self.clear_annotation_card_text_selection();
+                    let thread_id = uuid::Uuid::parse_str(&id).ok()?;
+                    let action = AnnotationCardAction::parse(&action)?;
+                    return Some(self.activate_annotation_card_action(thread_id, action));
+                }
+                if let Some(hit) = self.annotation_card_text_hit_exact(mouse.column, mouse.row) {
+                    self.persistent_text_selection = None;
+                    self.table_selection_geometry = None;
+                    self.selection_created_at = None;
+                    self.annotation_ui.card_text_selection = None;
+                    self.annotation_ui.active_card_text_drag = None;
+                    self.annotation_ui.pending_card_text_drag =
+                        Some(PendingAnnotationCardTextDrag {
+                            thread_id: hit.thread_id,
+                            selectable_revision: hit.selectable_revision,
+                            anchor: hit.point,
+                            start_col: mouse.column,
+                            start_row: mouse.row,
+                        });
+                    return Some(InputOutcome::Changed);
+                }
+                if self.annotation_card_contains_point(mouse.column, mouse.row) {
+                    self.persistent_text_selection = None;
+                    self.table_selection_geometry = None;
+                    self.clear_annotation_card_text_selection();
+                    return Some(InputOutcome::Changed);
+                }
+                None
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(mut drag) = self.annotation_ui.active_card_text_drag {
+                    if let Some(head) = self.annotation_card_text_hit_nearest(
+                        drag.thread_id,
+                        drag.selectable_revision,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        drag.head = head;
+                        self.annotation_ui.active_card_text_drag = Some(drag);
+                    }
+                    return Some(InputOutcome::Changed);
+                }
+                let pending = self.annotation_ui.pending_card_text_drag?;
+                if pending.start_col.abs_diff(mouse.column) >= 1
+                    || pending.start_row.abs_diff(mouse.row) >= 1
+                {
+                    let head = self
+                        .annotation_card_text_hit_nearest(
+                            pending.thread_id,
+                            pending.selectable_revision,
+                            mouse.column,
+                            mouse.row,
+                        )
+                        .unwrap_or(pending.anchor);
+                    self.annotation_ui.active_card_text_drag = Some(ActiveAnnotationCardTextDrag {
+                        thread_id: pending.thread_id,
+                        selectable_revision: pending.selectable_revision,
+                        anchor: pending.anchor,
+                        head,
+                    });
+                    self.annotation_ui.pending_card_text_drag = None;
+                    return Some(InputOutcome::Changed);
+                }
+                Some(InputOutcome::Unchanged)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(drag) = self.annotation_ui.active_card_text_drag.take() {
+                    self.annotation_ui.pending_card_text_drag = None;
+                    if let Some(text) = self.reconstruct_annotation_card_selection(&drag)
+                        && !text.is_empty()
+                    {
+                        self.annotation_ui.card_text_selection =
+                            Some(AnnotationCardTextSelection {
+                                thread_id: drag.thread_id,
+                                selectable_revision: drag.selectable_revision,
+                                anchor: drag.anchor,
+                                head: drag.head,
+                            });
+                        self.selection_created_at = Some(Instant::now());
+                        self.copy_to_clipboard(&text);
+                    }
+                    return Some(InputOutcome::Changed);
+                }
+                if self.annotation_ui.pending_card_text_drag.take().is_some() {
+                    return Some(InputOutcome::Changed);
+                }
+                None
+            }
+            MouseEventKind::Up(MouseButton::Right) => {
+                if self.annotation_card_selection_contains_point(mouse.column, mouse.row) {
+                    return Some(self.open_annotation_card_context_menu(mouse.column, mouse.row));
+                }
+                self.annotation_card_contains_point(mouse.column, mouse.row)
+                    .then_some(InputOutcome::Unchanged)
+            }
+            _ => None,
         }
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return None;
-        }
+    }
 
-        let hit = self
-            .annotation_ui
+    fn annotation_card_contains_point(&self, column: u16, row: u16) -> bool {
+        self.annotation_ui
+            .card_placements
+            .iter()
+            .any(|placement| placement.area.contains((column, row).into()))
+    }
+
+    fn annotation_card_text_hit_exact(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<AnnotationCardTextHit> {
+        self.annotation_ui
             .card_placements
             .iter()
             .find_map(|placement| {
-                placement
-                    .buttons
-                    .iter()
-                    .find(|(_, area)| area.contains((mouse.column, mouse.row).into()))
-                    .map(|(action, _)| (placement.id.clone(), action.clone()))
-                    .or_else(|| {
-                        placement
-                            .area
-                            .contains((mouse.column, mouse.row).into())
-                            .then(|| {
-                                (
-                                    placement.id.clone(),
-                                    AnnotationCardAction::Toggle.as_str().to_string(),
-                                )
-                            })
-                    })
-            });
-        let (id, action) = hit?;
-        let thread_id = uuid::Uuid::parse_str(&id).ok()?;
-        let action = AnnotationCardAction::parse(&action)?;
-        Some(self.activate_annotation_card_action(thread_id, action))
+                let thread_id = uuid::Uuid::parse_str(&placement.id).ok()?;
+                placement.selectable_lines.iter().find_map(|line| {
+                    if line.screen_y != row {
+                        return None;
+                    }
+                    let width = UnicodeWidthStr::width(line.text.as_str()) as u16;
+                    let right = line.screen_x.saturating_add(width);
+                    (width > 0 && column >= line.screen_x && column < right).then_some(
+                        AnnotationCardTextHit {
+                            thread_id,
+                            selectable_revision: placement.selectable_revision,
+                            point: AnnotationCardTextPoint {
+                                row: line.row,
+                                col: column.saturating_sub(line.screen_x),
+                            },
+                        },
+                    )
+                })
+            })
+    }
+
+    fn annotation_card_text_hit_nearest(
+        &self,
+        thread_id: ThreadId,
+        selectable_revision: u64,
+        column: u16,
+        row: u16,
+    ) -> Option<AnnotationCardTextPoint> {
+        let placement = self
+            .annotation_ui
+            .card_placements
+            .iter()
+            .find(|placement| {
+                placement.id == thread_id.to_string()
+                    && placement.selectable_revision == selectable_revision
+            })?;
+        placement
+            .selectable_lines
+            .iter()
+            .filter_map(|line| {
+                let width = UnicodeWidthStr::width(line.text.as_str()) as u16;
+                if width == 0 {
+                    return None;
+                }
+                let right = line.screen_x.saturating_add(width);
+                let (col_distance, col) = if column < line.screen_x {
+                    (line.screen_x - column, 0)
+                } else if column >= right {
+                    (column - right.saturating_sub(1), width.saturating_sub(1))
+                } else {
+                    (0, column - line.screen_x)
+                };
+                Some((
+                    (line.screen_y.abs_diff(row), col_distance),
+                    AnnotationCardTextPoint { row: line.row, col },
+                ))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, point)| point)
+    }
+
+    fn reconstruct_annotation_card_selection(
+        &self,
+        drag: &ActiveAnnotationCardTextDrag,
+    ) -> Option<String> {
+        let placement = self
+            .annotation_ui
+            .card_placements
+            .iter()
+            .find(|placement| {
+                placement.id == drag.thread_id.to_string()
+                    && placement.selectable_revision == drag.selectable_revision
+            })?;
+        let (start, end) = ordered_annotation_card_points(drag.anchor, drag.head);
+        let mut text = String::new();
+        let mut found = false;
+        for line in &placement.selectable_lines {
+            let Some(cols) = annotation_card_selected_cols(start, end, line.row, &line.text) else {
+                continue;
+            };
+            if found {
+                text.push('\n');
+            }
+            found = true;
+            text.push_str(&crate::scrollback::types::slice_display_cols(
+                &line.text, cols.start, cols.end,
+            ));
+        }
+        found.then_some(text)
+    }
+
+    pub(crate) fn render_annotation_card_text_selection(&self, buf: &mut ratatui::buffer::Buffer) {
+        let (thread_id, selectable_revision, anchor, head) =
+            if let Some(drag) = self.annotation_ui.active_card_text_drag {
+                (
+                    drag.thread_id,
+                    drag.selectable_revision,
+                    drag.anchor,
+                    drag.head,
+                )
+            } else if let Some(selection) = &self.annotation_ui.card_text_selection {
+                (
+                    selection.thread_id,
+                    selection.selectable_revision,
+                    selection.anchor,
+                    selection.head,
+                )
+            } else {
+                return;
+            };
+        let Some(placement) = self.annotation_ui.card_placements.iter().find(|placement| {
+            placement.id == thread_id.to_string()
+                && placement.selectable_revision == selectable_revision
+        }) else {
+            return;
+        };
+        let (start, end) = ordered_annotation_card_points(anchor, head);
+        let theme = Theme::current();
+        for line in &placement.selectable_lines {
+            let Some(cols) = annotation_card_selected_cols(start, end, line.row, &line.text) else {
+                continue;
+            };
+            for col in cols {
+                if let Some(cell) = buf.cell_mut((line.screen_x.saturating_add(col), line.screen_y))
+                {
+                    crate::scrollback::text_selection::apply_selection_highlight(&theme, cell);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_annotation_card_text_selection(&mut self) {
+        self.annotation_ui.pending_card_text_drag = None;
+        self.annotation_ui.active_card_text_drag = None;
+        self.annotation_ui.card_text_selection = None;
+        self.selection_created_at = None;
+    }
+
+    fn annotation_card_selection_contains_point(&self, column: u16, row: u16) -> bool {
+        let Some(selection) = &self.annotation_ui.card_text_selection else {
+            return false;
+        };
+        let Some(hit) = self.annotation_card_text_hit_exact(column, row) else {
+            return false;
+        };
+        if hit.thread_id != selection.thread_id
+            || hit.selectable_revision != selection.selectable_revision
+        {
+            return false;
+        }
+        let (start, end) = ordered_annotation_card_points(selection.anchor, selection.head);
+        hit.point >= start && hit.point <= end
+    }
+
+    fn open_annotation_card_context_menu(&mut self, column: u16, row: u16) -> InputOutcome {
+        let Some(selection) = &self.annotation_ui.card_text_selection else {
+            return InputOutcome::Unchanged;
+        };
+        if !self
+            .annotation_runtime
+            .state
+            .threads
+            .contains_key(&selection.thread_id)
+        {
+            return InputOutcome::Unchanged;
+        }
+        self.annotation_ui.context_menu = Some(AnnotationContextMenuState::new(
+            AnnotationComposerTarget::FollowUp {
+                thread_id: selection.thread_id,
+            },
+            column,
+            row,
+        ));
+        InputOutcome::Changed
     }
 
     fn activate_annotation_card_action(
@@ -413,7 +710,42 @@ impl AgentView {
         let theme = Theme::current();
         let theme_revision = annotation_theme_revision(&theme);
         let hovered = self.annotation_ui.hovered_card_button.as_ref();
+        let new_composer_anchor =
+            self.annotation_ui
+                .composer
+                .as_ref()
+                .and_then(|composer| match &composer.target {
+                    AnnotationComposerTarget::New { anchor } => Some((
+                        anchor.transcript_key.clone(),
+                        anchor.selected_text_hash.clone(),
+                        anchor.end_source_line,
+                    )),
+                    AnnotationComposerTarget::FollowUp { .. } => None,
+                });
+        let follow_up_composer_thread = self
+            .annotation_ui
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.target.thread_id());
         let mut decorations = Vec::new();
+
+        // A new annotation editor is the first decoration after the selected
+        // source line, so it stays visually attached to that line even when
+        // other annotation cards share the same anchor.
+        if let Some((transcript_key, selected_text_hash, after_source_line)) =
+            new_composer_anchor.as_ref()
+            && let Some((entry_idx, _)) =
+                resolve_transcript_key_with_index(&self.scrollback, transcript_key)
+            && let Some(entry_id) = self.scrollback.entry(entry_idx).map(|entry| entry.id)
+        {
+            decorations.push(build_inline_composer_decoration(
+                selected_text_hash,
+                entry_id,
+                *after_source_line,
+                content_width,
+                &theme,
+            ));
+        }
 
         for pending in &self.annotation_runtime.pending_forks {
             let (thread_id, pending) = pending;
@@ -478,14 +810,15 @@ impl AgentView {
                     self.annotation_ui.card_body_cache_misses.saturating_add(1);
                 lines
             };
+            let after_source_line = if attached {
+                thread.anchor.end_source_line
+            } else {
+                usize::MAX
+            };
             decorations.push(build_thread_card_with_body(
                 thread,
                 entry_id,
-                if attached {
-                    thread.anchor.end_source_line
-                } else {
-                    usize::MAX
-                },
+                after_source_line,
                 content_width,
                 expanded,
                 active,
@@ -495,6 +828,16 @@ impl AgentView {
                 theme_revision,
                 &theme,
             ));
+            // Follow-up editors belong immediately below their owning card.
+            if follow_up_composer_thread == Some(*thread_id) {
+                decorations.push(build_inline_composer_decoration(
+                    &thread.anchor.selected_text_hash,
+                    entry_id,
+                    after_source_line,
+                    content_width,
+                    &theme,
+                ));
+            }
         }
         self.annotation_ui
             .thread_card_bodies
@@ -505,6 +848,42 @@ impl AgentView {
                     .get(thread_id)
                     .is_some_and(|thread| !thread.deleted)
             });
+        let selection_is_valid = |thread_id: ThreadId, selectable_revision: u64| {
+            decorations.iter().any(|decoration| {
+                decoration.id == thread_id.to_string()
+                    && crate::scrollback::decorations::selectable_revision(decoration)
+                        == selectable_revision
+            })
+        };
+        if self
+            .annotation_ui
+            .pending_card_text_drag
+            .is_some_and(|selection| {
+                !selection_is_valid(selection.thread_id, selection.selectable_revision)
+            })
+        {
+            self.annotation_ui.pending_card_text_drag = None;
+        }
+        if self
+            .annotation_ui
+            .active_card_text_drag
+            .is_some_and(|selection| {
+                !selection_is_valid(selection.thread_id, selection.selectable_revision)
+            })
+        {
+            self.annotation_ui.active_card_text_drag = None;
+        }
+        if self
+            .annotation_ui
+            .card_text_selection
+            .as_ref()
+            .is_some_and(|selection| {
+                !selection_is_valid(selection.thread_id, selection.selectable_revision)
+            })
+        {
+            self.annotation_ui.card_text_selection = None;
+            self.selection_created_at = None;
+        }
         self.scrollback.set_decorations(decorations);
     }
 
@@ -579,6 +958,73 @@ impl AgentView {
     }
 }
 
+fn ordered_annotation_card_points(
+    first: AnnotationCardTextPoint,
+    second: AnnotationCardTextPoint,
+) -> (AnnotationCardTextPoint, AnnotationCardTextPoint) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn annotation_card_selected_cols(
+    start: AnnotationCardTextPoint,
+    end: AnnotationCardTextPoint,
+    row: usize,
+    text: &str,
+) -> Option<std::ops::Range<u16>> {
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let width = UnicodeWidthStr::width(text) as u16;
+    if width == 0 {
+        return None;
+    }
+    let col_start = if row == start.row {
+        start.col.min(width.saturating_sub(1))
+    } else {
+        0
+    };
+    let col_end = if row == end.row {
+        end.col.saturating_add(1).min(width)
+    } else {
+        width
+    };
+    (col_start < col_end).then_some(col_start..col_end)
+}
+
+fn build_inline_composer_decoration(
+    selected_text_hash: &str,
+    entry_id: EntryId,
+    after_source_line: usize,
+    width: u16,
+    theme: &Theme,
+) -> ScrollbackDecoration {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ANNOTATION_COMPOSER_DECORATION_ID.hash(&mut hasher);
+    selected_text_hash.hash(&mut hasher);
+    after_source_line.hash(&mut hasher);
+    width.hash(&mut hasher);
+    theme.bg_visual.hash(&mut hasher);
+
+    ScrollbackDecoration {
+        id: ANNOTATION_COMPOSER_DECORATION_ID.into(),
+        revision: hasher.finish(),
+        entry_id,
+        after_source_line,
+        lines: vec![DecorationLine::new(
+            Line::from(Span::styled(
+                "│  ",
+                Style::default().fg(theme.accent_user).bg(theme.bg_visual),
+            )),
+            theme.bg_visual,
+        )],
+        buttons: Vec::new(),
+    }
+}
+
 fn build_pending_card(
     thread_id: ThreadId,
     pending: &PendingAnnotationFork,
@@ -626,7 +1072,6 @@ fn build_pending_card(
         status,
         body,
         action_rows,
-        width,
         revision_for_pending(thread_id, pending, width, hovered),
         theme,
     )
@@ -700,7 +1145,6 @@ fn build_thread_card_with_body(
         status,
         body,
         action_rows,
-        width,
         revision_for_thread(
             thread.thread_id,
             content_revision,
@@ -803,7 +1247,6 @@ fn build_card(
     status: &str,
     body: Vec<Line<'static>>,
     action_rows: Vec<(Line<'static>, Vec<DecorationButton>)>,
-    width: u16,
     revision: u64,
     theme: &Theme,
 ) -> ScrollbackDecoration {
@@ -832,16 +1275,22 @@ fn build_card(
     ]);
     let mut decoration_lines = vec![DecorationLine::new(header, background)];
     for line in body {
+        let selectable_text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
         let mut spans = vec![Span::styled("│  ", Style::default().fg(theme.gray_dim))];
         spans.extend(line.spans);
-        decoration_lines.push(DecorationLine::new(Line::from(spans), background));
+        decoration_lines.push(
+            DecorationLine::new(Line::from(spans), background)
+                .with_selectable_text(CARD_PREFIX_WIDTH as u16, selectable_text),
+        );
     }
-    let mut buttons = vec![DecorationButton {
-        row: 0,
-        col: 0,
-        width,
-        action: AnnotationCardAction::Toggle.as_str().into(),
-    }];
+    // Expand/collapse is intentionally available only through the explicit
+    // action chip. Treating the whole header/card as a toggle made ordinary
+    // clicks and text-selection starts too easy to misfire.
+    let mut buttons = Vec::new();
     for (line, mut row_buttons) in action_rows {
         let row = decoration_lines.len();
         for button in &mut row_buttons {
@@ -1233,7 +1682,271 @@ mod tests {
         assert!(actions.contains("follow_up"));
         assert!(actions.contains("open_child"));
         assert!(actions.contains("delete"));
+        assert!(
+            card.buttons
+                .iter()
+                .filter(|button| button.action == "toggle")
+                .all(|button| button.row > 0),
+            "only the explicit action chip may toggle the card"
+        );
         assert!(card.lines.len() > 5, "expanded card must include body rows");
+    }
+
+    #[test]
+    fn card_body_rows_expose_copyable_text_without_card_chrome() {
+        let thread = completed_thread();
+        let card = build_thread_card(
+            &thread,
+            EntryId::new(1),
+            4,
+            48,
+            true,
+            false,
+            None,
+            &Theme::current(),
+        );
+
+        let selectable: Vec<_> = card
+            .lines
+            .iter()
+            .filter_map(|line| line.selectable.as_ref().map(|text| text.text.as_str()))
+            .collect();
+        assert!(selectable.iter().any(|text| text.contains("Q  Why?")));
+        assert!(selectable.iter().any(|text| text.contains("A  Because.")));
+        assert!(
+            selectable.iter().all(|text| !text.starts_with('│')),
+            "copied text must omit visual card borders"
+        );
+    }
+
+    #[test]
+    fn clicking_card_content_does_not_toggle_expansion() {
+        let thread_id = uuid::Uuid::from_u128(80);
+        let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
+        agent.annotation_ui.expanded_threads.insert(thread_id);
+        agent.annotation_ui.card_placements = vec![crate::scrollback::DecorationPlacement {
+            id: thread_id.to_string(),
+            area: Rect::new(2, 3, 30, 5),
+            top_clipped: false,
+            bottom_clipped: false,
+            exact_anchor: true,
+            buttons: Vec::new(),
+            selectable_lines: Vec::new(),
+            selectable_revision: 0,
+        }];
+
+        let outcome = agent
+            .handle_annotation_card_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 8,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("card click must be consumed");
+
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(
+            agent.annotation_ui.expanded_threads.contains(&thread_id),
+            "passive card content must not collapse the thread"
+        );
+    }
+
+    #[test]
+    fn annotation_card_selection_reconstructs_copy_text_and_routes_menu_to_follow_up() {
+        let thread = completed_thread();
+        let thread_id = thread.thread_id;
+        let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
+        agent
+            .annotation_runtime
+            .state
+            .threads
+            .insert(thread_id, thread);
+        agent.annotation_ui.card_placements = vec![crate::scrollback::DecorationPlacement {
+            id: thread_id.to_string(),
+            area: Rect::new(2, 3, 30, 5),
+            top_clipped: false,
+            bottom_clipped: false,
+            exact_anchor: true,
+            buttons: Vec::new(),
+            selectable_lines: vec![
+                crate::scrollback::DecorationSelectableLinePlacement {
+                    row: 1,
+                    screen_x: 5,
+                    screen_y: 4,
+                    text: "Q  first".into(),
+                },
+                crate::scrollback::DecorationSelectableLinePlacement {
+                    row: 2,
+                    screen_x: 5,
+                    screen_y: 5,
+                    text: "A  second".into(),
+                },
+            ],
+            selectable_revision: 7,
+        }];
+        let drag = ActiveAnnotationCardTextDrag {
+            thread_id,
+            selectable_revision: 7,
+            anchor: AnnotationCardTextPoint { row: 1, col: 3 },
+            head: AnnotationCardTextPoint { row: 2, col: 4 },
+        };
+
+        assert_eq!(
+            agent
+                .reconstruct_annotation_card_selection(&drag)
+                .as_deref(),
+            Some("first\nA  se")
+        );
+        agent.annotation_ui.card_text_selection = Some(AnnotationCardTextSelection {
+            thread_id,
+            selectable_revision: 7,
+            anchor: drag.anchor,
+            head: drag.head,
+        });
+        assert!(matches!(
+            agent.open_annotation_card_context_menu(6, 5),
+            InputOutcome::Changed
+        ));
+        assert!(matches!(
+            agent
+                .annotation_ui
+                .context_menu
+                .as_ref()
+                .map(|menu| &menu.target),
+            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+        ));
+        assert!(matches!(
+            agent.activate_annotation_context_menu(),
+            InputOutcome::Changed
+        ));
+        assert!(matches!(
+            agent
+                .annotation_ui
+                .composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+        ));
+
+        agent.annotation_ui.composer = None;
+        assert!(matches!(
+            agent.open_annotation_composer_from_selection(),
+            InputOutcome::Changed
+        ));
+        assert!(matches!(
+            agent
+                .annotation_ui
+                .composer
+                .as_ref()
+                .map(|composer| &composer.target),
+            Some(AnnotationComposerTarget::FollowUp { thread_id: id }) if *id == thread_id
+        ));
+    }
+
+    #[test]
+    fn new_annotation_composer_is_a_one_row_decoration_after_the_source_line() {
+        let mut agent = agent_with_annotatable_selection();
+        assert!(matches!(
+            agent.open_annotation_composer_from_selection(),
+            InputOutcome::Changed
+        ));
+        agent.sync_annotation_decorations(80);
+
+        let composer = agent
+            .scrollback
+            .decoration_map()
+            .values()
+            .flatten()
+            .find(|decoration| decoration.id == ANNOTATION_COMPOSER_DECORATION_ID)
+            .expect("inline composer decoration");
+        assert_eq!(composer.after_source_line, 1);
+        assert_eq!(composer.row_count(), 1);
+    }
+
+    #[test]
+    fn follow_up_composer_is_immediately_below_its_annotation_card() {
+        let thread = completed_thread();
+        let thread_id = thread.thread_id;
+        let mut agent = agent_with_thread_card(thread);
+        assert!(matches!(
+            agent.open_annotation_follow_up(thread_id),
+            InputOutcome::Changed
+        ));
+        agent.sync_annotation_decorations(80);
+
+        let decorations = agent
+            .scrollback
+            .decoration_map()
+            .values()
+            .find(|decorations| {
+                decorations
+                    .iter()
+                    .any(|decoration| decoration.id == thread_id.to_string())
+            })
+            .expect("annotation decoration group");
+        let card_index = decorations
+            .iter()
+            .position(|decoration| decoration.id == thread_id.to_string())
+            .expect("thread card");
+        assert_eq!(
+            decorations
+                .get(card_index + 1)
+                .map(|decoration| decoration.id.as_str()),
+            Some(ANNOTATION_COMPOSER_DECORATION_ID)
+        );
+        assert_eq!(decorations[card_index + 1].row_count(), 1);
+    }
+
+    #[test]
+    fn inline_composer_renders_on_one_indented_row() {
+        let theme = Theme::current();
+        let mut state = AnnotationComposerState::new(
+            AnnotationComposerTarget::New { anchor: anchor() },
+            std::path::Path::new("/tmp"),
+        );
+        let screen = Rect::new(0, 0, 50, 8);
+        let row = Rect::new(2, 4, 40, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(screen);
+
+        let rendered = crate::views::annotation::render_annotation_composer(
+            &mut buffer,
+            row,
+            &mut state,
+            &theme,
+        )
+        .expect("one-row composer");
+
+        assert_eq!(state.input_area, Some(Rect::new(5, 4, 36, 1)));
+        assert_eq!(rendered.cursor_pos.map(|(_, y)| y), Some(4));
+        let rendered_row = (row.x..row.right())
+            .filter_map(|x| buffer.cell((x, row.y)).map(|cell| cell.symbol()))
+            .collect::<String>();
+        assert!(rendered_row.contains("Ask about the selected text"));
+    }
+
+    #[test]
+    fn context_menu_clears_guard_cells_around_wide_underlay_glyphs() {
+        let screen = Rect::new(0, 0, 40, 8);
+        let mut buffer = ratatui::buffer::Buffer::empty(screen);
+        buffer.set_string(4, 2, "如", Style::default());
+        buffer.set_string(28, 2, "界", Style::default());
+        let mut menu = AnnotationContextMenuState::new(
+            AnnotationComposerTarget::New { anchor: anchor() },
+            5,
+            2,
+        );
+
+        crate::views::annotation::render_annotation_context_menu(
+            &mut buffer,
+            screen,
+            &mut menu,
+            &Theme::current(),
+        );
+
+        assert_eq!(buffer.cell((4, 2)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((5, 2)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((28, 2)).unwrap().symbol(), "┐");
+        assert_eq!(buffer.cell((29, 2)).unwrap().symbol(), " ");
     }
 
     #[test]
@@ -1455,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_submit_keeps_backslash_continuation_draft_open() {
+    fn single_line_composer_submits_trailing_backslash_literally() {
         let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
         agent.open_annotation_composer(AnnotationComposerTarget::New { anchor: anchor() });
         agent
@@ -1467,13 +2180,35 @@ mod tests {
             .textarea
             .insert_str("explain this\\");
 
+        let outcome = agent.handle_annotation_overlay_input(&Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
         assert!(matches!(
-            agent.submit_annotation_composer(),
-            InputOutcome::Changed
+            outcome,
+            Some(InputOutcome::Action(Action::BeginInlineAnnotation { question, .. }))
+                if question == "explain this\\"
         ));
-        let composer = agent.annotation_ui.composer.as_ref().unwrap();
-        assert_eq!(composer.prompt.text(), "explain this\n");
-        assert!(agent.annotation_runtime.pending_forks.is_empty());
+        assert!(agent.annotation_ui.composer.is_none());
+    }
+
+    #[test]
+    fn single_line_composer_flattens_multiline_paste() {
+        let mut agent = test_agent_view(Some("parent"), "/tmp/project".into());
+        agent.open_annotation_composer(AnnotationComposerTarget::New { anchor: anchor() });
+
+        let outcome =
+            agent.handle_annotation_overlay_input(&Event::Paste("one\r\ntwo\nthree".into()));
+
+        assert!(matches!(outcome, Some(InputOutcome::Changed)));
+        assert_eq!(
+            agent
+                .annotation_ui
+                .composer
+                .as_ref()
+                .map(|composer| composer.prompt.text()),
+            Some("one two three")
+        );
     }
 
     #[test]
@@ -1521,6 +2256,8 @@ mod tests {
             bottom_clipped: false,
             exact_anchor: true,
             buttons: vec![("follow_up".into(), Rect::new(5, 6, 11, 1))],
+            selectable_lines: Vec::new(),
+            selectable_revision: 0,
         }];
 
         let outcome = agent

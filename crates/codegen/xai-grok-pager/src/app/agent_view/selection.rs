@@ -57,6 +57,7 @@ impl AgentView {
         {
             self.persistent_text_selection = None;
             self.table_selection_geometry = None;
+            self.annotation_ui.card_text_selection = None;
             self.selection_created_at = None;
             return true;
         }
@@ -287,6 +288,8 @@ impl AgentView {
             || self.pending_block_drag.is_some()
             || self.block_drag_selection.is_some()
             || self.deferred_text_press.is_some()
+            || self.annotation_ui.pending_card_text_drag.is_some()
+            || self.annotation_ui.active_card_text_drag.is_some()
     }
 
     /// Discard any in-progress scrollback drag + mouse-down latch (recovery path).
@@ -298,6 +301,8 @@ impl AgentView {
         self.pending_block_drag = None;
         self.block_drag_selection = None;
         self.deferred_text_press = None;
+        self.annotation_ui.pending_card_text_drag = None;
+        self.annotation_ui.active_card_text_drag = None;
         self.drag_autoscroll = None;
         self.last_drag_mouse = None;
     }

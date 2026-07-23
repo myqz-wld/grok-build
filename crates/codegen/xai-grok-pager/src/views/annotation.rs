@@ -5,38 +5,24 @@ use std::collections::{HashMap, HashSet};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::annotations::{AnnotationAnchor, ThreadId};
 use crate::render::SafeBuf;
 use crate::scrollback::decorations::DecorationPlacement;
 use crate::theme::Theme;
-use crate::views::modal_window::{
-    ModalSizing, ModalWindowConfig, ModalWindowState, Shortcut, render_modal_window,
-};
 use crate::views::prompt_widget::{PromptRenderResult, PromptStyle, PromptWidget};
 
-pub(crate) const COMPOSER_SUBMIT_ID: usize = 1;
-pub(crate) const COMPOSER_CANCEL_ID: usize = 2;
+pub(crate) const ANNOTATION_COMPOSER_DECORATION_ID: &str = "__annotation_composer__";
 
+#[derive(Debug)]
 pub(crate) enum AnnotationComposerTarget {
-    New {
-        anchor: AnnotationAnchor,
-    },
-    FollowUp {
-        thread_id: ThreadId,
-        anchor: AnnotationAnchor,
-    },
+    New { anchor: AnnotationAnchor },
+    FollowUp { thread_id: ThreadId },
 }
 
 impl AnnotationComposerTarget {
-    pub(crate) fn anchor(&self) -> &AnnotationAnchor {
-        match self {
-            Self::New { anchor } | Self::FollowUp { anchor, .. } => anchor,
-        }
-    }
-
     pub(crate) fn thread_id(&self) -> Option<ThreadId> {
         match self {
             Self::New { .. } => None,
@@ -48,7 +34,8 @@ impl AnnotationComposerTarget {
 pub(crate) struct AnnotationComposerState {
     pub(crate) target: AnnotationComposerTarget,
     pub(crate) prompt: PromptWidget,
-    pub(crate) window: ModalWindowState,
+    /// Screen-space input row from the most recent render.
+    pub(crate) input_area: Option<Rect>,
 }
 
 impl AnnotationComposerState {
@@ -56,21 +43,21 @@ impl AnnotationComposerState {
         Self {
             target,
             prompt: PromptWidget::new_with_cwd(cwd),
-            window: ModalWindowState::new(),
+            input_area: None,
         }
     }
 
-    pub(crate) fn title(&self) -> &'static str {
+    pub(crate) fn placeholder(&self) -> &'static str {
         if self.target.thread_id().is_some() {
-            "Follow up on annotation"
+            "Ask a follow-up…"
         } else {
-            "Annotate selection"
+            "Ask about the selected text…"
         }
     }
 }
 
 pub(crate) struct AnnotationContextMenuState {
-    pub(crate) anchor: AnnotationAnchor,
+    pub(crate) target: AnnotationComposerTarget,
     pub(crate) column: u16,
     pub(crate) row: u16,
     pub(crate) popup_area: Option<Rect>,
@@ -79,9 +66,9 @@ pub(crate) struct AnnotationContextMenuState {
 }
 
 impl AnnotationContextMenuState {
-    pub(crate) fn new(anchor: AnnotationAnchor, column: u16, row: u16) -> Self {
+    pub(crate) fn new(target: AnnotationComposerTarget, column: u16, row: u16) -> Self {
         Self {
-            anchor,
+            target,
             column,
             row,
             popup_area: None,
@@ -89,6 +76,37 @@ impl AnnotationContextMenuState {
             hovered: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AnnotationCardTextPoint {
+    pub(crate) row: usize,
+    pub(crate) col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingAnnotationCardTextDrag {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) selectable_revision: u64,
+    pub(crate) anchor: AnnotationCardTextPoint,
+    pub(crate) start_col: u16,
+    pub(crate) start_row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActiveAnnotationCardTextDrag {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) selectable_revision: u64,
+    pub(crate) anchor: AnnotationCardTextPoint,
+    pub(crate) head: AnnotationCardTextPoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnnotationCardTextSelection {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) selectable_revision: u64,
+    pub(crate) anchor: AnnotationCardTextPoint,
+    pub(crate) head: AnnotationCardTextPoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,10 +163,14 @@ impl AnnotationCardAction {
 #[derive(Default)]
 pub(crate) struct AnnotationUiState {
     pub(crate) composer: Option<AnnotationComposerState>,
+    pub(crate) composer_placement: Option<Rect>,
     pub(crate) context_menu: Option<AnnotationContextMenuState>,
     pub(crate) expanded_threads: HashSet<ThreadId>,
     pub(crate) card_placements: Vec<DecorationPlacement>,
     pub(crate) hovered_card_button: Option<(String, String)>,
+    pub(crate) pending_card_text_drag: Option<PendingAnnotationCardTextDrag>,
+    pub(crate) active_card_text_drag: Option<ActiveAnnotationCardTextDrag>,
+    pub(crate) card_text_selection: Option<AnnotationCardTextSelection>,
     pub(crate) thread_card_bodies: HashMap<ThreadId, AnnotationCardBodyCache>,
     /// Cheap instrumentation used by cache regression tests and diagnostics.
     pub(crate) card_body_cache_misses: u64,
@@ -158,108 +180,43 @@ pub(crate) fn render_annotation_composer(
     buf: &mut Buffer,
     area: Rect,
     state: &mut AnnotationComposerState,
-    compact: bool,
     theme: &Theme,
 ) -> Option<PromptRenderResult> {
-    let shortcuts = [
-        Shortcut {
-            label: "Enter submit",
-            clickable: true,
-            id: COMPOSER_SUBMIT_ID,
-        },
-        Shortcut {
-            label: "Esc cancel",
-            clickable: true,
-            id: COMPOSER_CANCEL_ID,
-        },
-        Shortcut {
-            label: "Shift+Enter newline",
-            clickable: false,
-            id: 0,
-        },
-    ];
-    let config = ModalWindowConfig {
-        title: state.title(),
-        tabs: None,
-        shortcuts: &shortcuts,
-        sizing: ModalSizing {
-            width_pct: 0.72,
-            max_width: 100,
-            min_width: 40,
-            v_margin: 6,
-            h_pad: 2,
-            v_pad: 1,
-            footer_lines: 2,
-        }
-        .with_compact(compact),
-        fold_info: None,
-    };
-    let modal = render_modal_window(buf, area, &mut state.window, &config, theme)?;
-    if modal.content.height < 4 {
+    const INDENT: u16 = 3;
+    if area.height == 0 || area.width < INDENT + 5 {
+        state.input_area = None;
         return None;
     }
 
-    let anchor = state.target.anchor();
-    let role = match anchor.entry_role {
-        crate::annotations::AnnotationEntryRole::User => "User",
-        crate::annotations::AnnotationEntryRole::Assistant => "Assistant",
+    let input_area = Rect {
+        x: area.x + INDENT,
+        y: area.y,
+        width: area.width.saturating_sub(INDENT + 1),
+        height: 1,
     };
-    let lines = if anchor.start_source_line == anchor.end_source_line {
-        format!("L{}", anchor.start_source_line)
-    } else {
-        format!("L{}-L{}", anchor.start_source_line, anchor.end_source_line)
-    };
-    let meta = Line::from(vec![
-        Span::styled(
-            format!("{role} · {lines}"),
-            Style::default()
-                .fg(theme.accent_user)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " · inherited through this turn",
-            Style::default().fg(theme.gray),
-        ),
-    ]);
-    buf.set_line_safe(modal.content.x, modal.content.y, &meta, modal.content.width);
-
-    let quote: String = anchor
-        .selected_text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let quote_width = modal.content.width.saturating_sub(4) as usize;
-    let quote = crate::render::line_utils::truncate_str(&quote, quote_width);
-    let quote_line = Line::from(vec![
-        Span::styled("“", Style::default().fg(theme.gray_dim)),
-        Span::styled(quote, Style::default().fg(theme.gray)),
-        Span::styled("”", Style::default().fg(theme.gray_dim)),
-    ]);
-    buf.set_line_safe(
-        modal.content.x,
-        modal.content.y + 1,
-        &quote_line,
-        modal.content.width,
-    );
-
-    let prompt_area = Rect {
-        x: modal.content.x,
-        y: modal.content.y + 3,
-        width: modal.content.width,
-        height: modal.content.height.saturating_sub(3),
-    };
-    let mut style = PromptStyle::inline(theme.bg_base);
+    state.input_area = Some(input_area);
+    let mut style = PromptStyle::inline(theme.bg_visual);
     style.show_prefix = true;
-    style.placeholder_override = Some(if state.target.thread_id().is_some() {
-        "Ask a follow-up..."
-    } else {
-        "Ask about the selected text..."
-    });
-    Some(
-        state
-            .prompt
-            .draw(buf, prompt_area, Some(area), &style, None, None),
-    )
+    style.prefix_override = Some(("↳ ", theme.accent_user));
+    style.placeholder_override = Some(state.placeholder());
+    style.image_preview = false;
+    let rendered = state.prompt.draw(buf, input_area, None, &style, None, None);
+
+    // PromptWidget intentionally hides placeholder text while focused in the
+    // main composer. This compact inline editor stays focused, so paint its
+    // hint explicitly without changing the shared widget's behavior.
+    if state.prompt.text().is_empty() {
+        let textarea = state.prompt.textarea_area();
+        let placeholder =
+            crate::render::line_utils::truncate_str(state.placeholder(), textarea.width as usize);
+        buf.set_string_safe(
+            textarea.x,
+            textarea.y,
+            &placeholder,
+            Style::default().fg(theme.gray).bg(theme.bg_visual),
+        );
+    }
+    Some(rendered)
 }
 
 pub(crate) fn render_annotation_context_menu(
@@ -285,7 +242,23 @@ pub(crate) fn render_annotation_context_menu(
         .min(area.bottom().saturating_sub(height))
         .max(area.y);
     let popup = Rect::new(x, y, width, height);
-    Clear.render(popup, buf);
+    // A popup edge can bisect a CJK/emoji cell already present in the
+    // underlying frame. Clearing one guard column on each side forces the
+    // terminal diff to erase both halves of any wide glyph before painting
+    // the border, avoiding intermittent missing/overwritten menu edges.
+    let guard_x = popup.x.saturating_sub(u16::from(popup.x > area.x));
+    let guard_right = popup
+        .right()
+        .saturating_add(u16::from(popup.right() < area.right()))
+        .min(area.right());
+    let guarded = Rect::new(
+        guard_x,
+        popup.y,
+        guard_right.saturating_sub(guard_x),
+        popup.height,
+    );
+    Clear.render(guarded, buf);
+    buf.set_style(guarded, Style::default().bg(theme.bg_base));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.gray_dim))
@@ -301,6 +274,6 @@ pub(crate) fn render_annotation_context_menu(
         Style::default().fg(theme.text_primary).bg(theme.bg_base)
     };
     buf.set_string_safe(inner.x, inner.y, LABEL, style);
-    state.popup_area = Some(popup);
+    state.popup_area = Some(guarded);
     state.action_area = Some(Rect::new(inner.x, inner.y, inner.width, 1));
 }

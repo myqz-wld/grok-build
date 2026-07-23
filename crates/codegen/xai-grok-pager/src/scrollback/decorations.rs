@@ -5,6 +5,8 @@
 //! search, export, and replay.  Callers supply already-wrapped styled rows and
 //! stable entry/source-line anchors for each frame.
 
+use std::hash::{Hash, Hasher};
+
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::text::Line;
@@ -16,6 +18,12 @@ use super::types::BlockOutput;
 pub struct DecorationLine {
     pub content: Line<'static>,
     pub background: Color,
+    /// Optional text-selection projection for this visual-only row.
+    ///
+    /// The text remains decoration-owned and therefore never enters
+    /// transcript selection, search, export, or replay. `col` is the display
+    /// column where `text` begins within the entry content area.
+    pub selectable: Option<DecorationSelectableText>,
 }
 
 impl DecorationLine {
@@ -23,8 +31,23 @@ impl DecorationLine {
         Self {
             content,
             background,
+            selectable: None,
         }
     }
+
+    pub fn with_selectable_text(mut self, col: u16, text: impl Into<String>) -> Self {
+        self.selectable = Some(DecorationSelectableText {
+            col,
+            text: text.into(),
+        });
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DecorationSelectableText {
+    pub col: u16,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +100,31 @@ pub struct DecorationPlacement {
     /// False means the deterministic message-boundary fallback was used.
     pub exact_anchor: bool,
     pub buttons: Vec<(String, Rect)>,
+    /// Visible selectable text rows projected into screen space.
+    pub selectable_lines: Vec<DecorationSelectableLinePlacement>,
+    /// Stable across hover/style-only redraws; changes when selectable text,
+    /// wrapping, or row positions change.
+    pub selectable_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecorationSelectableLinePlacement {
+    /// Zero-based row within the complete decoration, including clipped rows.
+    pub row: usize,
+    pub screen_x: u16,
+    pub screen_y: u16,
+    pub text: String,
+}
+
+pub(crate) fn selectable_revision(decoration: &ScrollbackDecoration) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (row, line) in decoration.lines.iter().enumerate() {
+        if let Some(selectable) = &line.selectable {
+            row.hash(&mut hasher);
+            selectable.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 pub(crate) struct ResolvedDecoration<'a> {
@@ -258,10 +306,10 @@ mod tests {
             revision: 1,
             entry_id,
             after_source_line: 2,
-            lines: vec![DecorationLine::new(
-                Line::raw("ANNOTATION CARD"),
-                Color::Blue,
-            )],
+            lines: vec![
+                DecorationLine::new(Line::raw("ANNOTATION CARD"), Color::Blue)
+                    .with_selectable_text(3, "ANNOTATION CARD"),
+            ],
             buttons: Vec::new(),
         }]);
         state.prepare_layout(40, 20);
@@ -284,6 +332,15 @@ mod tests {
         assert!(row_of("ANNOTATION CARD") < row_of("three"));
         assert_eq!(output.decorations.len(), 1);
         assert!(output.decorations[0].exact_anchor);
+        assert_eq!(output.decorations[0].selectable_lines.len(), 1);
+        assert_eq!(
+            output.decorations[0].selectable_lines[0].text,
+            "ANNOTATION CARD"
+        );
+        assert_eq!(
+            output.decorations[0].selectable_lines[0].screen_x,
+            output.decorations[0].area.x + 3
+        );
     }
 
     #[test]

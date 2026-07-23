@@ -651,6 +651,7 @@ impl AgentView {
                         }
                         self.persistent_text_selection = None;
                         self.table_selection_geometry = None;
+                        self.clear_annotation_card_text_selection();
                         self.selection_created_at = None;
                         if !has_native_link_hover()
                             && is_link_modifier_held(mouse.modifiers)
@@ -696,6 +697,7 @@ impl AgentView {
                         if above_prompt_strip {
                             self.persistent_text_selection = None;
                             self.table_selection_geometry = None;
+                            self.clear_annotation_card_text_selection();
                             self.selection_created_at = None;
                             self.deferred_text_press = Some((mouse.column, mouse.row));
                             InputOutcome::Changed
@@ -766,6 +768,7 @@ impl AgentView {
                                     1 => {
                                         self.persistent_text_selection = None;
                                         self.table_selection_geometry = None;
+                                        self.clear_annotation_card_text_selection();
                                         self.selection_created_at = None;
                                         if hit.entry_idx != BTW_OVERLAY_ENTRY_IDX {
                                             self.scrollback.set_selected(Some(hit.entry_idx));

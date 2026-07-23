@@ -1495,6 +1495,8 @@ impl AgentView {
         self.hit_upgrade_cta
             .set_unless_dropdown(upgrade_cta_rect, dropdown_open);
         let mut inline_edit_cursor: Option<(u16, u16)> = None;
+        let mut annotation_cursor: Option<(u16, u16)> = None;
+        let mut annotation_post_flush: Option<crate::terminal::overlay::Escapes> = None;
         {
             self.sync_pending_user_input_marks();
             self.scrollback.set_cwd(Some(self.session.cwd.clone()));
@@ -1529,7 +1531,21 @@ impl AgentView {
                     scratch,
                 );
             let sb_output = sb_rendered.output;
-            self.annotation_ui.card_placements = sb_output.decorations.clone();
+            self.annotation_ui.composer_placement = sb_output
+                .decorations
+                .iter()
+                .find(|placement| {
+                    placement.id == crate::views::annotation::ANNOTATION_COMPOSER_DECORATION_ID
+                })
+                .map(|placement| placement.area);
+            self.annotation_ui.card_placements = sb_output
+                .decorations
+                .iter()
+                .filter(|placement| {
+                    placement.id != crate::views::annotation::ANNOTATION_COMPOSER_DECORATION_ID
+                })
+                .cloned()
+                .collect();
             self.update_scrollback_selection_state(
                 sb_output.selection_model.clone(),
                 sb_rendered.selection_boundaries,
@@ -1653,6 +1669,21 @@ impl AgentView {
                     self.table_geometry_for_selection(sel.entry_idx, sel.range_id),
                     buf,
                 );
+            }
+            self.render_annotation_card_text_selection(buf);
+            if let Some(composer) = self.annotation_ui.composer.as_mut() {
+                composer.input_area = None;
+                if let Some(composer_area) = self.annotation_ui.composer_placement
+                    && let Some(rendered) = crate::views::annotation::render_annotation_composer(
+                        buf,
+                        composer_area,
+                        composer,
+                        &theme,
+                    )
+                {
+                    annotation_cursor = rendered.cursor_pos;
+                    annotation_post_flush = rendered.post_flush_escapes;
+                }
             }
             agent::render_hook_hover_popup(
                 buf,
@@ -4186,23 +4217,7 @@ impl AgentView {
             self.hit_goal_close.rect = close_rect;
             self.frame_occluder_rects.push(overlay_rect);
         }
-        let mut annotation_cursor = None;
-        if let Some(composer) = self.annotation_ui.composer.as_mut() {
-            if let Some(rendered) = crate::views::annotation::render_annotation_composer(
-                buf, area, composer, compact, &theme,
-            ) {
-                annotation_cursor = rendered.cursor_pos;
-                if let Some(escapes) = rendered.post_flush_escapes {
-                    match prompt_post_flush.as_mut() {
-                        Some(existing) => existing.append(escapes.into()),
-                        None => prompt_post_flush = Some(escapes.into()),
-                    }
-                }
-            }
-            if let Some(popup) = composer.window.popup_area {
-                self.frame_occluder_rects.push(popup);
-            }
-        } else if let Some(menu) = self.annotation_ui.context_menu.as_mut() {
+        if let Some(menu) = self.annotation_ui.context_menu.as_mut() {
             crate::views::annotation::render_annotation_context_menu(buf, area, menu, &theme);
             if let Some(popup) = menu.popup_area {
                 self.frame_occluder_rects.push(popup);
@@ -4280,6 +4295,12 @@ impl AgentView {
                 None => {
                     prompt_post_flush = Some(crate::terminal::overlay::PostFlush::plain(seq));
                 }
+            }
+        }
+        if let Some(escapes) = annotation_post_flush {
+            match prompt_post_flush.as_mut() {
+                Some(existing) => existing.append(escapes.into()),
+                None => prompt_post_flush = Some(escapes.into()),
             }
         }
         let cursor = if annotation_cursor.is_some() {

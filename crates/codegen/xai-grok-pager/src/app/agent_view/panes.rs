@@ -96,6 +96,13 @@ impl AgentView {
         }
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
+            && self.annotation_ui.card_text_selection.is_some()
+        {
+            self.clear_annotation_card_text_selection();
+            return InputOutcome::Changed;
+        }
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
             && self.highlighted_link_idx.take().is_some()
         {
             return InputOutcome::Changed;

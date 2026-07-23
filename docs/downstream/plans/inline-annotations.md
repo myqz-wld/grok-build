@@ -176,8 +176,8 @@ Multiple threads may stream concurrently. Routing is keyed by child session ID, 
   - `Alt+A` opens the question composer when there is one valid selection.
   - Right mouse release on/inside the selected region opens a small context menu; `Annotate selection` opens the same composer.
 - Composer:
-  - shows `User/Assistant · Lx-Ly` and a one-line quote preview;
-  - supports multiline input using existing prompt-editing conventions;
+  - renders as one indented input row directly after the selected source line;
+  - all Enter variants submit the single-line field;
   - `Esc` cancels without forking;
   - submit creates the thread and starts the child.
 - Inline card:
@@ -185,6 +185,8 @@ Multiple threads may stream concurrently. Routing is keyed by child session ID, 
   - header: `Annotation · Assistant · L12-L15` plus status;
   - body contains ordered question/answer exchanges rendered as Markdown;
   - actions: expand/collapse, follow up, open child session intentionally, cancel active answer, delete card record;
+  - only the explicit expand/collapse action changes folding; passive body clicks do not;
+  - body text supports decoration-only drag-copy and selection annotation, with annotation-on-annotation routed as a follow-up;
   - if the exact insertion line is unavailable because of a collapsed entry, render at the message boundary with the same line badge.
 - The card is a scrollback decoration layer, not a `ScrollbackEntry` transcript block.
 

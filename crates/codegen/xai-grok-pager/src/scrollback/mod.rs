@@ -35,7 +35,8 @@ pub use blocks::{
     AgentMessageBlock, SystemMessageBlock, ThinkingBlock, ToolCallBlock, UserPromptBlock,
 };
 pub use decorations::{
-    DecorationButton, DecorationLine, DecorationPlacement, ScrollbackDecoration,
+    DecorationButton, DecorationLine, DecorationPlacement, DecorationSelectableLinePlacement,
+    ScrollbackDecoration,
 };
 pub use entry::{EntryId, ScrollbackEntry};
 pub use layout::HorizontalLayout;

@@ -211,14 +211,19 @@ Where the terminal forwards right-click events, right-clicking inside the held
 selection also opens an **Annotate selection** action. `Alt+A` is the portable
 path because some terminals reserve right-click.
 
-Enter a question and press `Enter` to submit. `Shift+Enter` inserts a newline,
-and `Esc` closes the composer without creating a child session. The answer
-streams into a persistent card after the selected logical source line; terminal
-resize and text rewrapping do not change which line the card annotates.
+The selected source line gains a compact, indented one-row question field.
+Press `Enter` (including modified Enter variants) to submit, or `Esc` to cancel
+without creating a child session. The answer streams into a persistent card
+after the selected logical source line; terminal resize and text rewrapping do
+not change which line the card annotates.
 
 Card actions let you expand/collapse the thread, ask a follow-up in the same
 child session, intentionally open that child, cancel its active answer, or
-delete the parent-side card record. The hidden child inherits conversation
+delete the parent-side card record. Expansion changes only through the explicit
+**expand/collapse** action, not by clicking the card body. Card text can be
+drag-selected and copied; `Alt+A`, or right-clicking inside that held selection
+and choosing **Annotate selection**, routes the resulting question as a
+follow-up in the same child session. The hidden child inherits conversation
 history only through the selected message's turn and runs without tools,
 backend search, or memory injection. Annotation text does not enter the parent
 model context, transcript export, or search.

@@ -104,6 +104,7 @@ pub(super) fn navigate_clearing_selection(app: &mut AppView, f: impl FnOnce(&mut
     with_active_agent(app, |agent| {
         agent.persistent_text_selection = None;
         agent.table_selection_geometry = None;
+        agent.clear_annotation_card_text_selection();
         agent.selection_created_at = None;
         agent.highlighted_link_idx = None;
         f(&mut agent.scrollback);
