@@ -24,20 +24,14 @@ pub(crate) enum AnnotationComposerTarget {
     },
     FollowUp {
         thread_id: ThreadId,
+        /// Exact text selected inside the rendered annotation card. Generic
+        /// follow-ups do not carry a quoted annotation excerpt.
+        selected_annotation_text: Option<String>,
         /// Existing annotation-card row after which the inline editor belongs.
         /// `None` is used by the card's generic follow-up action and places the
         /// editor below the complete card.
         after_card_row: Option<usize>,
     },
-}
-
-impl AnnotationComposerTarget {
-    pub(crate) fn thread_id(&self) -> Option<ThreadId> {
-        match self {
-            Self::New { .. } => None,
-            Self::FollowUp { thread_id, .. } => Some(*thread_id),
-        }
-    }
 }
 
 pub(crate) struct AnnotationComposerState {
@@ -63,10 +57,13 @@ impl AnnotationComposerState {
     }
 
     pub(crate) fn placeholder(&self) -> &'static str {
-        if self.target.thread_id().is_some() {
-            "Ask a follow-up…"
-        } else {
-            "Ask about the selected text…"
+        match &self.target {
+            AnnotationComposerTarget::New { .. } => "Ask about the selected text…",
+            AnnotationComposerTarget::FollowUp {
+                selected_annotation_text: Some(_),
+                ..
+            } => "Ask about this annotation selection…",
+            AnnotationComposerTarget::FollowUp { .. } => "Ask a follow-up…",
         }
     }
 }
@@ -122,6 +119,8 @@ pub(crate) struct AnnotationCardTextSelection {
     pub(crate) selectable_revision: u64,
     pub(crate) anchor: AnnotationCardTextPoint,
     pub(crate) head: AnnotationCardTextPoint,
+    /// Plain rendered text represented by the held card selection.
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

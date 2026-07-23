@@ -49,16 +49,20 @@ impl AgentView {
         if crate::app::minimal_mode_active() {
             return InputOutcome::Unchanged;
         }
-        if let Some((thread_id, after_card_row)) = self
+        if let Some((thread_id, after_card_row, selected_annotation_text)) = self
             .annotation_ui
             .card_text_selection
             .as_ref()
             .map(|selection| {
                 let (_, end) = ordered_annotation_card_points(selection.anchor, selection.head);
-                (selection.thread_id, end.row)
+                (selection.thread_id, end.row, selection.text.clone())
             })
         {
-            return self.open_annotation_follow_up_at(thread_id, Some(after_card_row));
+            return self.open_annotation_follow_up_at(
+                thread_id,
+                Some(after_card_row),
+                Some(selected_annotation_text),
+            );
         }
         match self.selected_annotation_anchor() {
             Ok(anchor) => {
@@ -79,13 +83,14 @@ impl AgentView {
     }
 
     fn open_annotation_follow_up(&mut self, thread_id: ThreadId) -> InputOutcome {
-        self.open_annotation_follow_up_at(thread_id, None)
+        self.open_annotation_follow_up_at(thread_id, None, None)
     }
 
     fn open_annotation_follow_up_at(
         &mut self,
         thread_id: ThreadId,
         after_card_row: Option<usize>,
+        selected_annotation_text: Option<String>,
     ) -> InputOutcome {
         if let Some(message) = self.annotation_storage_unavailable() {
             self.show_toast(&message);
@@ -115,6 +120,7 @@ impl AgentView {
         }
         self.open_annotation_composer(AnnotationComposerTarget::FollowUp {
             thread_id,
+            selected_annotation_text,
             after_card_row,
         });
         InputOutcome::Changed
@@ -259,12 +265,15 @@ impl AgentView {
             AnnotationComposerTarget::New { anchor } => {
                 InputOutcome::Action(Action::BeginInlineAnnotation { anchor, question })
             }
-            AnnotationComposerTarget::FollowUp { thread_id, .. } => {
-                InputOutcome::Action(Action::FollowUpInlineAnnotation {
-                    thread_id,
-                    question,
-                })
-            }
+            AnnotationComposerTarget::FollowUp {
+                thread_id,
+                selected_annotation_text,
+                ..
+            } => InputOutcome::Action(Action::FollowUpInlineAnnotation {
+                thread_id,
+                question,
+                selected_annotation_text,
+            }),
         }
     }
 
@@ -279,8 +288,13 @@ impl AgentView {
             }
             AnnotationComposerTarget::FollowUp {
                 thread_id,
+                selected_annotation_text,
                 after_card_row,
-            } => self.open_annotation_follow_up_at(thread_id, after_card_row),
+            } => self.open_annotation_follow_up_at(
+                thread_id,
+                after_card_row,
+                selected_annotation_text,
+            ),
         }
     }
 
@@ -422,15 +436,16 @@ impl AgentView {
                     if let Some(text) = self.reconstruct_annotation_card_selection(&drag)
                         && !text.is_empty()
                     {
+                        self.copy_to_clipboard(&text);
                         self.annotation_ui.card_text_selection =
                             Some(AnnotationCardTextSelection {
                                 thread_id: drag.thread_id,
                                 selectable_revision: drag.selectable_revision,
                                 anchor: drag.anchor,
                                 head: drag.head,
+                                text,
                             });
                         self.selection_created_at = Some(Instant::now());
-                        self.copy_to_clipboard(&text);
                     }
                     return Some(InputOutcome::Changed);
                 }
@@ -635,6 +650,7 @@ impl AgentView {
         self.annotation_ui.context_menu = Some(AnnotationContextMenuState::new(
             AnnotationComposerTarget::FollowUp {
                 thread_id: selection.thread_id,
+                selected_annotation_text: Some(selection.text.clone()),
                 after_card_row: Some(
                     ordered_annotation_card_points(selection.anchor, selection.head)
                         .1
@@ -755,6 +771,7 @@ impl AgentView {
                     AnnotationComposerTarget::FollowUp {
                         thread_id,
                         after_card_row,
+                        ..
                     } => Some((*thread_id, *after_card_row)),
                     AnnotationComposerTarget::New { .. } => None,
                 });
@@ -1891,6 +1908,7 @@ mod tests {
             selectable_revision: 7,
             anchor: drag.anchor,
             head: drag.head,
+            text: "first\nA  se".into(),
         });
         assert!(matches!(
             agent.open_annotation_card_context_menu(6, 5),
@@ -1904,8 +1922,9 @@ mod tests {
                 .map(|menu| &menu.target),
             Some(AnnotationComposerTarget::FollowUp {
                 thread_id: id,
+                selected_annotation_text: Some(text),
                 after_card_row: Some(2),
-            }) if *id == thread_id
+            }) if *id == thread_id && text == "first\nA  se"
         ));
         assert!(matches!(
             agent.activate_annotation_context_menu(),
@@ -1919,8 +1938,9 @@ mod tests {
                 .map(|composer| &composer.target),
             Some(AnnotationComposerTarget::FollowUp {
                 thread_id: id,
+                selected_annotation_text: Some(text),
                 after_card_row: Some(2),
-            }) if *id == thread_id
+            }) if *id == thread_id && text == "first\nA  se"
         ));
 
         agent.annotation_ui.composer = None;
@@ -1936,8 +1956,25 @@ mod tests {
                 .map(|composer| &composer.target),
             Some(AnnotationComposerTarget::FollowUp {
                 thread_id: id,
+                selected_annotation_text: Some(text),
                 after_card_row: Some(2),
-            }) if *id == thread_id
+            }) if *id == thread_id && text == "first\nA  se"
+        ));
+        let composer = agent.annotation_ui.composer.as_mut().unwrap();
+        assert_eq!(
+            composer.placeholder(),
+            "Ask about this annotation selection…"
+        );
+        composer.prompt.set_text("Explain this excerpt");
+        assert!(matches!(
+            agent.submit_annotation_composer(),
+            InputOutcome::Action(Action::FollowUpInlineAnnotation {
+                thread_id: id,
+                question,
+                selected_annotation_text: Some(text),
+            }) if id == thread_id
+                && question == "Explain this excerpt"
+                && text == "first\nA  se"
         ));
     }
 
@@ -2030,6 +2067,7 @@ mod tests {
                 row: selected_row,
                 col: 2,
             },
+            text: "Q ".into(),
         });
 
         assert!(matches!(
@@ -2044,8 +2082,9 @@ mod tests {
                 .map(|composer| &composer.target),
             Some(AnnotationComposerTarget::FollowUp {
                 thread_id: id,
+                selected_annotation_text: Some(text),
                 after_card_row: Some(row),
-            }) if *id == thread_id && *row == selected_row
+            }) if *id == thread_id && *row == selected_row && text == "Q "
         ));
         agent.sync_annotation_decorations(80);
 
@@ -2527,7 +2566,11 @@ mod tests {
         assert!(matches!(outcome, InputOutcome::Changed));
         assert!(matches!(
             agent.annotation_ui.composer.as_ref().map(|composer| &composer.target),
-            Some(AnnotationComposerTarget::FollowUp { thread_id: id, .. }) if *id == thread_id
+            Some(AnnotationComposerTarget::FollowUp {
+                thread_id: id,
+                selected_annotation_text: None,
+                after_card_row: None,
+            }) if *id == thread_id
         ));
 
         agent.annotation_ui.composer = None;

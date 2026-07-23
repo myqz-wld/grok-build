@@ -72,6 +72,7 @@ pub(super) fn dispatch_follow_up_inline_annotation(
     app: &mut AppView,
     thread_id: ThreadId,
     question: String,
+    selected_annotation_text: Option<String>,
 ) -> Vec<Effect> {
     if crate::app::minimal_mode_active() {
         return Vec::new();
@@ -82,7 +83,8 @@ pub(super) fn dispatch_follow_up_inline_annotation(
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return Vec::new();
     };
-    match agent.begin_annotation_follow_up(agent_id, thread_id, question) {
+    match agent.begin_annotation_follow_up(agent_id, thread_id, question, selected_annotation_text)
+    {
         Ok(effects) => effects,
         Err(message) => {
             agent.show_toast(&message);

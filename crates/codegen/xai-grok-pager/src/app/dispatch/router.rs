@@ -220,7 +220,10 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::FollowUpInlineAnnotation {
             thread_id,
             question,
-        } => dispatch_follow_up_inline_annotation(app, thread_id, question),
+            selected_annotation_text,
+        } => {
+            dispatch_follow_up_inline_annotation(app, thread_id, question, selected_annotation_text)
+        }
         Action::CancelInlineAnnotation(thread_id) => {
             dispatch_cancel_inline_annotation(app, thread_id)
         }

@@ -144,6 +144,9 @@ pub enum Action {
     FollowUpInlineAnnotation {
         thread_id: crate::annotations::ThreadId,
         question: String,
+        /// Exact text selected inside the annotation card, when this follow-up
+        /// originated from a held card-text selection.
+        selected_annotation_text: Option<String>,
     },
     /// Cancel only the active answer in one annotation child.
     CancelInlineAnnotation(crate::annotations::ThreadId),

@@ -58,6 +58,9 @@ pub(crate) enum AnnotationExchangePhase {
 pub(crate) struct AnnotationInFlight {
     pub(crate) exchange_id: ExchangeId,
     pub(crate) question: String,
+    /// Ephemeral quoted context selected from the rendered annotation card.
+    /// The persisted exchange question remains the user's unmodified text.
+    pub(crate) selected_annotation_text: Option<String>,
     pub(crate) prompt_id: String,
     pub(crate) phase: AnnotationExchangePhase,
     pub(crate) checkpoint_gate: AnswerCheckpointGate,
@@ -72,10 +75,19 @@ impl AnnotationInFlight {
         Self {
             exchange_id,
             question,
+            selected_annotation_text: None,
             prompt_id: format!("annotation-{exchange_id}"),
             phase,
             checkpoint_gate: AnswerCheckpointGate::new(Instant::now()),
         }
+    }
+
+    pub(crate) fn with_selected_annotation_text(
+        mut self,
+        selected_annotation_text: Option<String>,
+    ) -> Self {
+        self.selected_annotation_text = selected_annotation_text;
+        self
     }
 }
 
