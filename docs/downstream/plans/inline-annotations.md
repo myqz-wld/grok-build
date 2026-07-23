@@ -561,6 +561,14 @@ Manual smoke test in a standard TUI:
     error was traced to same-target Cargo artifacts from the detached upstream
     baseline comparison and disappeared after cleaning only the affected
     Markdown/PTY-harness package artifacts;
-  - merge delivery and local installation remain.
-- Current state: T8 is complete and T9 validation is in progress; pristine
-  `main` remains at `ba76b0a`.
+  - functional merge commit `8097e18` is pushed on
+    `sync/upstream-20260722`, and `downstream/main` is fast-forwarded and
+    pushed without force;
+  - a release build from the delivered tree is installed at
+    `/Users/wanglidong/.local/bin/grok` as `grok 0.2.110 (8097e18)`;
+    the previous `grok 0.2.106 (ba76b0a)` binary is retained at
+    `/Users/wanglidong/.local/bin/grok.pre-annotations-0.2.106-ba76b0a`;
+  - the primary repository remains clean on `main@ba76b0a`.
+- Current state: T8 and T9 are complete; the reviewed annotation build is
+  synchronized with `upstream/main@a5727c5`, installed locally, and published
+  through `downstream/main`. Pristine `main` remains unchanged at `ba76b0a`.
