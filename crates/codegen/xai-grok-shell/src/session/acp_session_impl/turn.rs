@@ -2096,6 +2096,7 @@ impl SessionActor {
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
                 };
+            self.apply_actor_policy_tool_spec_overrides(&mut effective_tools);
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),

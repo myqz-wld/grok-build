@@ -7,6 +7,7 @@ mod hub_permission;
 mod manager;
 mod policy;
 mod prompter;
+mod read_only_shell;
 pub mod resolution;
 pub mod rules;
 mod shell_access;
@@ -43,6 +44,7 @@ pub use prompter::{
     PromptOutcome, is_enable_always_approve_option, mcp_pretty_name_if_qualified,
     mcp_titleize_segment, mcp_tool_action, mcp_tool_display_name,
 };
+pub use read_only_shell::is_read_only_shell_command;
 pub use shell_access::{ProtectedEditPermission, ProtectedEditReason};
 pub use state::PermissionState;
 pub use state::cleanup_stale_permission_state;

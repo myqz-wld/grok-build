@@ -450,6 +450,12 @@ Manual smoke test in a standard TUI:
   - each annotation turn now receives a hidden reminder naming the exact filtered tool definitions and clarifying that broader tool assumptions inherited from the parent System prompt do not apply;
   - any model call outside that read-only allowlist is rejected with an ACP protocol error before tool lifecycle events or dispatch;
   - focused fork/cutoff/hidden-state and actor-policy tests pass (6 tests at completion), and `cargo check -p xai-grok-shell` passes.
+  - on 2026-07-27, the local command tool was added behind a second, per-call
+    fail-closed policy: foreground `git diff`/status/log/show and common local
+    inspection pipelines are allowed, while mutation, file redirection,
+    backgrounding, shell expansion, network access, project-code execution,
+    unsafe Git configuration, and mixed unsafe chains are rejected before tool
+    lifecycle events or dispatch.
 - T5 completion (2026-07-22):
   - added parent-owned annotation runtime state, strict FIFO event persistence, lazy hidden-child loading, and one-in-flight exchange enforcement per thread;
   - routed annotation child ACP chunks and terminal states by child session id without changing the active parent or ordinary subagent views;

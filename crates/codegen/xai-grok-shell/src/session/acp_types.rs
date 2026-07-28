@@ -636,12 +636,22 @@ impl SessionActorPolicy {
         }
     }
 
+    /// Whether this restricted actor may expose the local command tool behind
+    /// the per-call read-only command parser.
+    pub(crate) fn allows_read_only_shell(self) -> bool {
+        matches!(self, Self::Annotation)
+    }
+
     /// Model-facing explanation of the actor's effective tool boundary.
     ///
     /// `tool_names` must come from the already policy-filtered definitions so
     /// the reminder reports the exact configured names rather than assuming a
     /// particular toolset or name override.
-    pub(crate) fn tool_capability_reminder(self, tool_names: &[String]) -> Option<String> {
+    pub(crate) fn tool_capability_reminder(
+        self,
+        tool_names: &[String],
+        shell_tool_names: &[String],
+    ) -> Option<String> {
         if self == Self::Standard {
             return None;
         }
@@ -654,17 +664,31 @@ impl SessionActorPolicy {
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            format!("The only callable tools available in this session are: {names}.")
+        };
+        let shell_boundary = if shell_tool_names.is_empty() {
+            "No shell command tool is currently available.".to_string()
+        } else {
+            let names = shell_tool_names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "The only callable tools available in this session are local read-only file \
-                 tools: {names}."
+                "The command tool {names} accepts only foreground local inspection commands \
+                 from its enforced read-only allowlist, including `git diff`, `git status`, \
+                 `git log`, `git show`, `ls`, `pwd`, `rg`, `grep`, `find`, `cat`, `head`, and \
+                 similar text readers. Pipes and chains are allowed only when every segment is \
+                 approved; redirection, backgrounding, variable or command expansion, network \
+                 access, project code execution, and mutating commands are rejected."
             )
         };
         Some(format!(
             "You are running inside a restricted inline annotation session. {available} \
-             Use these tools only to read, search, or list local files when that context is \
-             needed to answer the annotation question. You cannot edit, write, move, or delete \
-             files; execute shell commands; use MCP, web or other network tools; access memory; \
-             spawn subagents; or perform any external or mutating action. Any broader tool \
+             Use the file tools only to read, search, or list local files when that context is \
+             needed to answer the annotation question. {shell_boundary} You cannot edit, write, \
+             move, or delete files; use MCP, web or other network tools; access memory; spawn \
+             subagents; or perform any external or mutating action. Any broader tool \
              instructions inherited from the parent conversation do not apply to this session. \
              If the needed information cannot be obtained with the listed tools, say so and \
              answer from the available context."

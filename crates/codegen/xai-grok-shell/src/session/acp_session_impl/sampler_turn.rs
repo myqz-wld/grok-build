@@ -2,6 +2,14 @@
 //! facts/gates and retry, sampler config reconstruction, sampling-failure
 //! recovery, and per-response usage recording.
 use super::*;
+
+const ANNOTATION_SHELL_TOOL_DESCRIPTION: &str = "Run one foreground local inspection command. \
+This restricted annotation session accepts only an enforced read-only allowlist such as `git \
+diff`, `git status`, `git log`, `git show`, `ls`, `pwd`, `rg`, `grep`, `find`, `cat`, and \
+text-processing pipelines whose every segment is allowlisted. File writes or redirection, \
+backgrounding, shell expansion, network access, project code execution, and mutating commands \
+are rejected.";
+
 /// Auth-failure detector for tool errors. Matches strictly on HTTP 401
 /// when the error carries a structured status code, mirroring
 /// `SamplingError::is_auth_error` in xai-grok-sampling-types: 403 is
@@ -111,8 +119,11 @@ impl SessionActor {
     /// Defense-in-depth actor gate for one model-facing tool name.
     ///
     /// Standard sessions preserve the existing tool surface verbatim.
-    /// Annotation sessions require a registered, non-MCP tool whose metadata
-    /// says both "read-only" and one of the local file read/search/list kinds.
+    /// Annotation sessions require either a registered local read/search/list
+    /// tool or the registered local command tool. Command visibility is only
+    /// the first gate; each command is parsed again by
+    /// [`Self::actor_policy_block_reason`] before any lifecycle event or
+    /// dispatch.
     pub(super) fn actor_policy_allows_tool(&self, tool_name: &str) -> bool {
         let policy = self.startup_hints.actor_policy;
         if policy == SessionActorPolicy::Standard {
@@ -124,8 +135,54 @@ impl SessionActor {
             return false;
         };
         identity.namespace != xai_grok_tools::types::tool::ToolNamespace::MCP
-            && identity.read_only
-            && policy.allows_local_tool_kind(identity.tool_kind)
+            && ((identity.read_only && policy.allows_local_tool_kind(identity.tool_kind))
+                || (identity.tool_kind == xai_grok_tools::types::tool::ToolKind::Execute
+                    && policy.allows_read_only_shell()))
+    }
+
+    /// Return why one model tool call is blocked by the actor policy.
+    ///
+    /// The command branch parses the tool's real, rename-aware typed input and
+    /// applies the fail-closed read-only shell policy before `ToolStarted` or
+    /// permission handling can occur.
+    pub(super) async fn actor_policy_block_reason(
+        &self,
+        call: &crate::sampling::types::ToolCallResponse,
+    ) -> Option<String> {
+        if self.startup_hints.actor_policy == SessionActorPolicy::Standard {
+            return None;
+        }
+        if !self.actor_policy_allows_tool(&call.function.name) {
+            return Some("tool is outside the annotation capability set".to_string());
+        }
+
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        if bridge.tool_kind(&call.function.name)
+            != Some(xai_grok_tools::types::tool::ToolKind::Execute)
+        {
+            return None;
+        }
+        let raw_input = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            .unwrap_or(serde_json::Value::Null);
+        let parsed = match bridge.try_parse(&call.function.name, raw_input).await {
+            Ok(parsed) => parsed,
+            Err(_) => return Some("command arguments could not be parsed safely".to_string()),
+        };
+        let ToolInput::Bash(input) = parsed else {
+            return Some("execute-kind tool is not the local shell command tool".to_string());
+        };
+        if input.is_background {
+            return Some("background commands are unavailable in annotations".to_string());
+        }
+        if !xai_grok_workspace::permission::is_read_only_shell_command(
+            &input.command,
+            self.tool_context.cwd.as_path(),
+        ) {
+            return Some(
+                "command is not a permitted foreground read-only inspection command".to_string(),
+            );
+        }
+        None
     }
 
     /// Tell restricted actors their exact effective tool surface immediately
@@ -138,15 +195,25 @@ impl SessionActor {
             return;
         }
 
-        let mut tool_names = self
-            .prepare_tool_definitions_inner()
-            .await
+        let definitions = self.prepare_tool_definitions_inner().await;
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        let mut shell_tool_names = definitions
+            .iter()
+            .filter(|definition| {
+                bridge.tool_kind(&definition.function.name)
+                    == Some(xai_grok_tools::types::tool::ToolKind::Execute)
+            })
+            .map(|definition| definition.function.name.clone())
+            .collect::<Vec<_>>();
+        shell_tool_names.sort_unstable();
+        shell_tool_names.dedup();
+        let mut tool_names = definitions
             .into_iter()
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
         tool_names.sort_unstable();
         tool_names.dedup();
-        if let Some(reminder) = policy.tool_capability_reminder(&tool_names) {
+        if let Some(reminder) = policy.tool_capability_reminder(&tool_names, &shell_tool_names) {
             self.push_system_reminder(&reminder);
         }
     }
@@ -192,6 +259,23 @@ impl SessionActor {
             .map(ToolSpec::from)
             .collect()
     }
+
+    /// Rewrite inherited parent tool specs so a restricted child never sees
+    /// the standard shell description. Names, order, and parameter schemas
+    /// remain inherited; only the capability description is narrowed.
+    pub(super) fn apply_actor_policy_tool_spec_overrides(&self, specs: &mut [ToolSpec]) {
+        if self.startup_hints.actor_policy != SessionActorPolicy::Annotation {
+            return;
+        }
+        let bridge = self.agent.borrow().tool_bridge().clone();
+        for spec in specs {
+            if bridge.tool_kind(&spec.name) == Some(xai_grok_tools::types::tool::ToolKind::Execute)
+            {
+                spec.description = Some(ANNOTATION_SHELL_TOOL_DESCRIPTION.to_string());
+            }
+        }
+    }
+
     /// Hosted tools with overrides applied, plus the applied overrides to echo, in one pass.
     fn resolve_hosted(
         &self,
@@ -262,10 +346,21 @@ impl SessionActor {
         let bridge = self.agent.borrow().tool_bridge().clone();
         let defs = bridge.tool_definitions_builtins_only().await;
         let plan_active = self.plan_mode.lock().is_active();
-        filter_cursor_tools_by_plan_mode(defs, plan_active)
+        let mut filtered = filter_cursor_tools_by_plan_mode(defs, plan_active)
             .into_iter()
             .filter(|td| self.actor_policy_allows_tool(&td.function.name))
-            .collect()
+            .collect::<Vec<_>>();
+        if self.startup_hints.actor_policy == SessionActorPolicy::Annotation {
+            for definition in &mut filtered {
+                if bridge.tool_kind(&definition.function.name)
+                    == Some(xai_grok_tools::types::tool::ToolKind::Execute)
+                {
+                    definition.function.description =
+                        Some(ANNOTATION_SHELL_TOOL_DESCRIPTION.to_string());
+                }
+            }
+        }
+        filtered
     }
     /// Memoized per-model [`ModelAuthFacts`](crate::agent::config::ModelAuthFacts),
     /// keyed by `model_id`.

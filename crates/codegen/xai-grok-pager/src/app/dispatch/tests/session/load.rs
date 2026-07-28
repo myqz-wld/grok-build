@@ -114,6 +114,7 @@ fn standard_tui_chat_session_restores_persisted_annotations() {
             restore_summary: None,
             restore_degree: None,
             running_prompt_id: None,
+            scheduler_background_loops: None,
         }),
         &mut app,
     );

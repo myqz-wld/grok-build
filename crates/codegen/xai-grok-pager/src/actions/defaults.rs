@@ -757,7 +757,7 @@ pub(super) fn default_actions(
             hint_key_display: Some("Alt+A"),
             requires_confirmation: false,
             long_help: Some(
-                "Opens a question composer for selected text in a completed User or Assistant message.\nThe answer runs in a hidden fork through that message's turn with local read-only file tools and appears inline as a persistent annotation.",
+                "Opens a question composer for selected text in a completed User or Assistant message.\nThe answer runs in a hidden fork through that message's turn with local read-only file tools plus a restricted inspection-only shell and appears inline as a persistent annotation.",
             ),
         },
         ActionDef {

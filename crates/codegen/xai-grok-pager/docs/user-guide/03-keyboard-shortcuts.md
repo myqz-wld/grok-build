@@ -225,11 +225,15 @@ drag-selected and copied; `Alt+A`, or right-clicking inside that held selection
 and choosing **Annotate selection**, routes the resulting question as a
 follow-up in the same child session. The hidden child inherits conversation
 history only through the selected message's turn. It can read, search, and list
-local project files, but cannot edit files, run commands, use MCP or network
-tools, or access memory injection. Before each question, the child receives a
-hidden reminder naming its exact available tools and clarifying that broader
-tool instructions inherited from the parent do not apply. Annotation text does
-not enter the parent model context, transcript export, or search.
+local project files. It can also run foreground commands from a strict local
+inspection allowlist, including `git diff`, `git status`, `git log`, `git show`,
+`ls`, `pwd`, `rg`, `grep`, `find`, `cat`, and text-processing pipelines whose
+every segment is allowed. It cannot edit files, redirect shell output to files,
+run background or project-code commands, use shell expansion, or use MCP or
+network tools. Before each question, the child receives a hidden reminder
+naming its exact available tools and clarifying that broader tool instructions
+inherited from the parent do not apply. Annotation text does not enter the
+parent model context, transcript export, or search.
 
 If child creation fails, the draft card offers **retry** and **dismiss**. If
 the source message later disappears or changes, the card moves to a detached
