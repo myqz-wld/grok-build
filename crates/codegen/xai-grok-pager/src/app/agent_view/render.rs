@@ -20,7 +20,7 @@ use crate::theme::Theme;
 use crate::views::btw_overlay::BTW_OVERLAY_ENTRY_IDX;
 use crate::views::modal;
 use crate::views::plan_approval_view::PlanApprovalFocus;
-use crate::views::prompt_widget::{PromptFlag, PromptInfo, PromptStyle};
+use crate::views::prompt_widget::{PromptBg, PromptFlag, PromptInfo, PromptStyle};
 use crate::views::question_view::QUESTION_VIEW_HPAD;
 use crate::views::shortcuts_bar::{HintItem, PendingHint, ShortcutsBar};
 use crate::views::{agent, turn_status};
@@ -128,7 +128,7 @@ impl AgentView {
                     ]
                 }
             }
-            PlanApprovalFocus::Preview => vec![],
+            PlanApprovalFocus::Preview => vec![HintItem::new(key!('y'), "copy plan")],
         }
     }
     /// Returns the *exact* hints the bottom shortcuts bar would render right now.
@@ -208,6 +208,7 @@ impl AgentView {
             } else {
                 let mut h = vec![
                     HintItem::new(key!('c'), "comment"),
+                    HintItem::new(key!('y'), "copy plan"),
                     HintItem::new(key!('f', CONTROL), "fullscreen"),
                 ];
                 if !self.plan_comments.is_empty() {
@@ -803,7 +804,7 @@ impl AgentView {
             chrome: true,
             chrome_pad_left: layout_cfg.block_pad_left,
             chrome_pad_right: layout_cfg.block_pad_right,
-            bg_override: None,
+            bg: PromptBg::Default,
             accent_color_override: if let Some(c) = self.prompt_input_mode.accent_color(&theme) {
                 Some(c)
             } else if effective_plan || casual_commenting {
@@ -945,7 +946,7 @@ impl AgentView {
             chrome: false,
             chrome_pad_left: 0,
             chrome_pad_right: 0,
-            bg_override: Some(theme.bg_visual),
+            bg: PromptBg::Panel(theme.bg_visual),
             accent_color_override: None,
             border_color_override: None,
             prefix_override: None,
@@ -980,7 +981,7 @@ impl AgentView {
                 chrome: false,
                 chrome_pad_left: 0,
                 chrome_pad_right: 0,
-                bg_override: Some(theme.bg_visual),
+                bg: PromptBg::Panel(theme.bg_visual),
                 accent_color_override: None,
                 border_color_override: None,
                 prefix_override: None,
@@ -2055,6 +2056,7 @@ impl AgentView {
                 ));
                 self.hit_cancel_button.rect = None;
                 self.hit_bg_button.rect = None;
+                self.hit_watching_cue.rect = None;
             } else {
                 let has_running_execute = !self.is_subagent_view
                     && self
@@ -2073,36 +2075,42 @@ impl AgentView {
                 let turn_output = turn_status::render_turn_status(
                     buf,
                     turn_area,
-                    &self.session.state,
-                    &activity,
-                    self.turn_elapsed(),
-                    self.activity_started_at,
-                    tick,
-                    drain_blocked,
-                    Some(turn_status::MouseButtons {
-                        cancel_hovered: self.hit_cancel_button.hovered,
-                        bg_hovered: self.hit_bg_button.hovered,
-                    }),
-                    has_running_execute,
-                    self.context_state.as_ref().map(|c| c.used),
-                    self.mcp_init_progress.as_ref(),
-                    self.bash_turn,
-                    is_pending_user_input,
-                    goal_verifying,
-                    watchers,
-                    parked,
-                    false,
-                    held_queue,
-                    held_queue_top_sendable,
+                    turn_status::TurnStatusArgs {
+                        state: &self.session.state,
+                        activity: &activity,
+                        turn_elapsed: self.turn_elapsed(),
+                        activity_started_at: self.activity_started_at,
+                        tick,
+                        drain_blocked,
+                        buttons: Some(turn_status::MouseButtons {
+                            cancel_hovered: self.hit_cancel_button.hovered,
+                            bg_hovered: self.hit_bg_button.hovered,
+                            watching_hovered: self.hit_watching_cue.hovered,
+                        }),
+                        has_running_execute,
+                        total_tokens: self.context_state.as_ref().map(|c| c.used),
+                        mcp_init_progress: self.mcp_init_progress.as_ref(),
+                        is_bash_turn: self.bash_turn,
+                        is_pending_user_input,
+                        goal_verifying,
+                        watchers,
+                        parked,
+                        flat_background: false,
+                        held_queue,
+                        held_queue_top_sendable,
+                    },
                 );
                 self.hit_cancel_button
                     .set_unless_dropdown(turn_output.cancel_button, dropdown_open);
                 self.hit_bg_button
                     .set_unless_dropdown(turn_output.bg_button, dropdown_open);
+                self.hit_watching_cue
+                    .set_unless_dropdown(turn_output.watching_cue, dropdown_open);
             }
         } else {
             self.hit_cancel_button.clear();
             self.hit_bg_button.clear();
+            self.hit_watching_cue.clear();
             self.hit_plan_approval_status.clear();
         }
         let privacy_banner_owns_slot = privacy_banner && layout.banner.height >= 2;
@@ -2377,7 +2385,7 @@ impl AgentView {
                         chrome: false,
                         chrome_pad_left: 0,
                         chrome_pad_right: 0,
-                        bg_override: Some(row_bg),
+                        bg: PromptBg::Panel(row_bg),
                         accent_color_override: None,
                         border_color_override: None,
                         prefix_override: None,
@@ -2785,7 +2793,6 @@ impl AgentView {
             };
             let voice_overlay = if voice_available && (voice_listening || voice_interim.is_some()) {
                 Some(crate::views::prompt_widget::VoicePromptOverlay {
-                    listening: voice_listening,
                     interim: voice_interim,
                     color: theme.accent_running,
                 })
@@ -3241,6 +3248,7 @@ impl AgentView {
                 } else {
                     let mut h = vec![
                         HintItem::new(key!('c'), "comment"),
+                        HintItem::new(key!('y'), "copy plan"),
                         HintItem::new(key!('f', CONTROL), "fullscreen"),
                     ];
                     if !self.plan_comments.is_empty() {
@@ -3333,6 +3341,7 @@ impl AgentView {
                 .with_pending(pending_hint)
                 .render(layout.shortcuts, buf);
         }
+        let line_viewer_toast = self.active_toast_message().map(|s| s.to_string());
         let is_plan_viewer = self.is_plan_viewer();
         let has_plan_comments = !self.plan_comments.is_empty();
         let casual_commenting = self.is_casual_commenting();
@@ -3379,6 +3388,26 @@ impl AgentView {
                 &theme,
                 effective_comment_count,
             );
+            let toast_area = viewer
+                .last_popup_area
+                .or(viewer.last_modal_area)
+                .unwrap_or(overlay_area);
+            if let Some(ref msg) = line_viewer_toast
+                && toast_area.height > 0
+                && let Some(toast_text) = fit_toast_text(msg, toast_area.width.saturating_sub(1))
+            {
+                let w = toast_text.chars().count() as u16;
+                let tx = toast_area.right().saturating_sub(w + 1);
+                let ty = toast_area.bottom().saturating_sub(1);
+                for (i, ch) in toast_text.chars().enumerate() {
+                    if let Some(cell) = buf.cell_mut((tx + i as u16, ty)) {
+                        cell.set_char(ch);
+                        cell.fg = theme.accent_user;
+                        cell.bg = theme.bg_base;
+                        cell.modifier = ratatui::prelude::Modifier::BOLD;
+                    }
+                }
+            }
             let in_plan_approval = self.plan_approval_view.is_some();
             let on_comment = in_plan_approval
                 && viewer
@@ -3404,11 +3433,15 @@ impl AgentView {
                 } else {
                     h.push(HintItem::new(key!('a'), "approve"));
                 }
+                h.push(HintItem::new(key!('y'), "copy plan"));
                 h.push(HintItem::new(key!('q'), "quit plan"));
                 h.push(HintItem::new(key!(Tab), "prompt"));
                 h
             } else if in_plan_approval {
-                let mut h = vec![HintItem::new(key!('c'), "comment")];
+                let mut h = vec![
+                    HintItem::new(key!('c'), "comment"),
+                    HintItem::new(key!('y'), "copy plan"),
+                ];
                 if approval_has_comments {
                     h.push(HintItem::new(key!('s'), "send"));
                 } else {
@@ -3434,9 +3467,13 @@ impl AgentView {
                     vec![
                         HintItem::new(key!(Enter), "edit"),
                         HintItem::new(key!('x'), "delete"),
+                        HintItem::new(key!('y'), "copy plan"),
                     ]
                 } else {
-                    vec![HintItem::new(key!('c'), "comment")]
+                    vec![
+                        HintItem::new(key!('c'), "comment"),
+                        HintItem::new(key!('y'), "copy plan"),
+                    ]
                 };
                 if has_plan_comments {
                     h.push(HintItem::new(key!('s'), "send"));
@@ -4264,8 +4301,23 @@ impl AgentView {
             let mut view = self.workflows_view.clone();
             view.normalize(&runs);
             let tick = self.tasks.tick_count() as usize;
+            let live: crate::views::workflows::WorkflowAgentLiveMap = self
+                .subagent_sessions
+                .iter()
+                .filter(|(_, info)| info.workflow_run_id.is_some() && info.is_running())
+                .map(|(id, info)| {
+                    (
+                        id.clone(),
+                        crate::views::workflows::WorkflowAgentLiveStatus {
+                            activity: info.activity_label.clone(),
+                            tokens_used: info.tokens_used,
+                            elapsed_ms: Some(info.display_elapsed().as_millis() as u64),
+                        },
+                    )
+                })
+                .collect();
             let popup =
-                crate::views::workflows::render_workflows(buf, area, &runs, &mut view, tick);
+                crate::views::workflows::render_workflows(buf, area, &runs, &mut view, tick, &live);
             self.workflows_view = view;
             if let Some(popup) = popup {
                 self.frame_occluder_rects.push(popup);

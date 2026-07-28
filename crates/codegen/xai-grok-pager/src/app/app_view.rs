@@ -755,6 +755,13 @@ pub struct AppView {
     /// non-selectable headers. Gated by `GROK_SESSION_PICKER_GROUPED` env var
     /// or remote settings `session_picker_grouped`; defaults to `false`.
     pub session_picker_grouped: bool,
+    /// Startup-only seed for `AgentView::scheduler_background_loops`, resolved
+    /// once from the config layers plus the remote tier known at connect.
+    /// Read only until a session's own value arrives on its `session/new` /
+    /// `session/load` response, and by the session-less dashboard. Never
+    /// refreshed afterwards — the authoritative value is per session, pinned by
+    /// the shell when that session's actor spawned.
+    pub scheduler_background_loops_seed: bool,
     /// Whether Ctrl+C before first server activity rewinds the prompt
     /// back into the input box. Gated by `GROK_CANCEL_REWIND` env /
     /// `[features] cancel_rewind` config / remote settings flag.
@@ -1229,6 +1236,17 @@ impl AppView {
                 .as_deref()
                 .is_some_and(|r| r.eq_ignore_ascii_case("admin"))
     }
+    /// Why `coding_data_sharing` is locked for this user (`None` = editable).
+    /// Mirrors the dispatch guards in `set_coding_data_sharing`.
+    pub fn coding_data_sharing_lock(&self) -> Option<crate::settings::CodingDataSharingLock> {
+        if self.is_zdr {
+            Some(crate::settings::CodingDataSharingLock::Zdr)
+        } else if self.is_team_non_admin() {
+            Some(crate::settings::CodingDataSharingLock::TeamManaged)
+        } else {
+            None
+        }
+    }
     /// Welcome privacy banner visibility gates.
     pub fn privacy_banner_should_show(&self) -> bool {
         if self.screen_mode.is_minimal() {
@@ -1544,6 +1562,7 @@ impl AppView {
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
             session_picker_grouped: false,
+            scheduler_background_loops_seed: true,
             cancel_rewind_enabled: true,
             session_recap_available: false,
             tutorial: None,
@@ -1880,6 +1899,27 @@ impl AppView {
         self.import_claude_modal.is_some()
             || self.voice_listening()
             || self.voice_state.pending_cold_start()
+    }
+    /// Commit interim on real send keys only (not multiline bare Enter).
+    fn maybe_commit_voice_interim_before_submit_key(&mut self, key: &crossterm::event::KeyEvent) {
+        if self.registry.matches_id(ActionId::InterjectPrompt, key) {
+            let _ = crate::voice::commit_interim_into_prompt(self);
+            return;
+        }
+        let multiline = match self.active_view {
+            ActiveView::Agent(id) => self.agents.get(&id).is_some_and(|a| a.multiline_mode),
+            ActiveView::AgentDashboard => self.dashboard.as_ref().is_some_and(|d| d.multiline_mode),
+            _ => false,
+        };
+        let is_send = if multiline {
+            crate::input::is_mod_enter(key)
+        } else {
+            matches!(key.code, KeyCode::Enter)
+                || self.registry.matches_id(ActionId::SendPrompt, key)
+        };
+        if is_send {
+            let _ = crate::voice::commit_interim_into_prompt(self);
+        }
     }
     /// The active agent's view, when an agent tab is focused.
     ///
@@ -2623,6 +2663,11 @@ impl AppView {
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
                 }
+                if let Event::Key(key) = ev
+                    && key.kind != KeyEventKind::Release
+                {
+                    self.maybe_commit_voice_interim_before_submit_key(key);
+                }
                 if self.screen_mode.is_minimal()
                     && let Event::Key(key) = ev
                     && key.kind != KeyEventKind::Release
@@ -2668,6 +2713,11 @@ impl AppView {
             ActiveView::AgentDashboard => {
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
+                }
+                if let Event::Key(key) = ev
+                    && key.kind != KeyEventKind::Release
+                {
+                    self.maybe_commit_voice_interim_before_submit_key(key);
                 }
                 let attached_raw = self.dashboard.as_ref().and_then(|d| d.attached_agent);
                 let attached = attached_raw.filter(|id| self.agents.contains_key(id));
@@ -5792,6 +5842,7 @@ pub(crate) mod tests {
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
             session_picker_grouped: false,
+            scheduler_background_loops_seed: true,
             cancel_rewind_enabled: true,
             session_recap_available: false,
             tutorial: None,
@@ -9926,6 +9977,7 @@ pub(crate) mod tests {
                     model: None,
                     state: "running".to_owned(),
                     tokens_used: 0,
+                    duration_ms: 0,
                 }],
                 agent_budget: None,
                 agents_used: 0,
