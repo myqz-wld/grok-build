@@ -2411,9 +2411,9 @@ async fn annotation_fork_copies_only_the_selected_turn_prefix() {
     adapter.init_session(&source, default_model_id()).await.unwrap();
     for item in [
         ConversationItem::system("system"),
-        ConversationItem::user("question zero"),
+        chat_user("question zero", 0),
         ConversationItem::assistant("answer zero"),
-        ConversationItem::user("question one"),
+        chat_user("question one", 1),
         ConversationItem::assistant("answer one"),
     ] {
         adapter.append_chat_message(&source, &item).await.unwrap();
