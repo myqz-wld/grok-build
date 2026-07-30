@@ -265,7 +265,7 @@ pub enum TickDemand {
 pub const SLOW_TICK_INTERVAL: Duration = Duration::from_millis(83);
 /// Welcome toast lifetime (wall clock, so the duration holds whether the
 /// event loop is ticking Slow or Fast).
-const WELCOME_TOAST_DURATION: Duration = Duration::from_secs(4);
+const WELCOME_TOAST_DURATION: Duration = Duration::from_secs(2);
 /// Which prompt box in-flight voice dictation appends its finalized text to.
 /// Captured when recording **starts** so a trailing STT final still lands where
 /// the user was dictating, even if they navigate away — or toggle a dashboard
@@ -858,9 +858,10 @@ pub struct AppView {
     /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
     /// (click → `AnnouncementsOpenCta(Welcome)`).
     pub welcome_upgrade_cta_rect: Option<ratatui::layout::Rect>,
-    pub welcome_privacy_banner_accept_rect: Option<ratatui::layout::Rect>,
-    pub welcome_privacy_banner_customize_rect: Option<ratatui::layout::Rect>,
-    pub welcome_privacy_banner_legal_rect: Option<ratatui::layout::Rect>,
+    pub welcome_privacy_banner_opt_in_rect: Option<ratatui::layout::Rect>,
+    pub welcome_privacy_banner_opt_out_rect: Option<ratatui::layout::Rect>,
+    pub welcome_privacy_banner_terms_rect: Option<ratatui::layout::Rect>,
+    pub welcome_privacy_banner_policy_rect: Option<ratatui::layout::Rect>,
     /// Transient welcome toast: (message, wall-clock expiry).
     pub welcome_toast: Option<(String, std::time::Instant)>,
     /// Sticky hover flag for the privacy banner buttons (redraw on enter/leave).
@@ -1064,7 +1065,12 @@ pub struct AppView {
     /// Local `[privacy].privacy_banner_acked` (RFC 3339 UTC).
     pub privacy_banner_acked: Option<String>,
     /// Accept awaits ACP success before ack.
-    pub privacy_banner_accept_inflight: bool,
+    pub privacy_banner_opt_in_inflight: bool,
+    /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed
+    /// on the `TaskResult`, so an older write's late reply — whose
+    /// `rollback_to_opted_in` was captured before the newer one — cannot
+    /// clobber the current value.
+    pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` = no override (default `true`).
     pub show_tips: Option<bool>,
     /// Persisted `[cli].auto_update` mirror. `None` = no override (default `true`).
@@ -1191,8 +1197,16 @@ fn privacy_banner_reshow_elapsed(acked_at: &str, reshow_days: Option<u64>) -> bo
     };
     chrono::Utc::now() >= next
 }
-/// Bottom-right toast overlay on the welcome screen (mirrors agent toast style).
-fn paint_welcome_toast(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect, msg: &str) {
+/// Welcome-screen toast overlay (mirrors agent toast style).
+///
+/// Prefer one row above the prompt, right-aligned to it. Fall back to
+/// the view bottom-right when no prompt rect is available (login / gate).
+fn paint_welcome_toast(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    msg: &str,
+    prompt_rect: Option<ratatui::layout::Rect>,
+) {
     let theme = crate::theme::Theme::current();
     let max_msg = (area.width as usize).saturating_sub(4);
     if max_msg == 0 || area.height == 0 {
@@ -1205,8 +1219,16 @@ fn paint_welcome_toast(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout:
         format!(" {}… ", truncated.trim_end())
     };
     let w = toast.chars().count() as u16;
-    let x = area.right().saturating_sub(w + 1);
-    let y = area.bottom().saturating_sub(1);
+    let (x, y) = if let Some(prompt) = prompt_rect.filter(|r| r.width > 0 && r.y > area.y) {
+        let max_x = area.right().saturating_sub(w).max(area.x);
+        let x = prompt.right().saturating_sub(w + 1).clamp(area.x, max_x);
+        (x, prompt.y.saturating_sub(1))
+    } else {
+        (
+            area.right().saturating_sub(w + 1),
+            area.bottom().saturating_sub(1),
+        )
+    };
     for (i, ch) in toast.chars().enumerate() {
         if let Some(cell) = buf.cell_mut((x + i as u16, y)) {
             cell.set_char(ch);
@@ -1442,9 +1464,10 @@ impl AppView {
             welcome_refresh_rect: None,
             welcome_gate_url_rect: None,
             welcome_upgrade_cta_rect: None,
-            welcome_privacy_banner_accept_rect: None,
-            welcome_privacy_banner_customize_rect: None,
-            welcome_privacy_banner_legal_rect: None,
+            welcome_privacy_banner_opt_in_rect: None,
+            welcome_privacy_banner_opt_out_rect: None,
+            welcome_privacy_banner_terms_rect: None,
+            welcome_privacy_banner_policy_rect: None,
             welcome_toast: None,
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
@@ -1519,7 +1542,8 @@ impl AppView {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_accept_inflight: false,
+            privacy_banner_opt_in_inflight: false,
+            coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -1956,7 +1980,7 @@ impl AppView {
     ///
     /// From the dashboard, toasts route into the dispatch input's inline
     /// error slot. From an agent view the existing per-agent toast machinery
-    /// fires. On welcome, a bottom-right overlay for
+    /// fires. On welcome, an overlay above the prompt for
     /// [`WELCOME_TOAST_DURATION`].
     pub fn show_toast(&mut self, msg: &str) {
         match self.active_view {
@@ -2459,11 +2483,10 @@ impl AppView {
                     refresh_rect: self.welcome_refresh_rect.as_ref(),
                     gate_url_rect: self.welcome_gate_url_rect.as_ref(),
                     upgrade_cta_rect: self.welcome_upgrade_cta_rect.as_ref(),
-                    privacy_banner_accept_rect: self.welcome_privacy_banner_accept_rect.as_ref(),
-                    privacy_banner_customize_rect: self
-                        .welcome_privacy_banner_customize_rect
-                        .as_ref(),
-                    privacy_banner_legal_rect: self.welcome_privacy_banner_legal_rect.as_ref(),
+                    privacy_banner_opt_in_rect: self.welcome_privacy_banner_opt_in_rect.as_ref(),
+                    privacy_banner_opt_out_rect: self.welcome_privacy_banner_opt_out_rect.as_ref(),
+                    privacy_banner_terms_rect: self.welcome_privacy_banner_terms_rect.as_ref(),
+                    privacy_banner_policy_rect: self.welcome_privacy_banner_policy_rect.as_ref(),
                     on_privacy_banner: &mut self.welcome_on_privacy_banner,
                     on_upgrade_cta: &mut self.welcome_on_upgrade_cta,
                     upgrade_cta_keyboard: welcome_pinned_upgrade_cta,
@@ -3057,9 +3080,10 @@ struct WelcomeInputCtx<'a> {
     /// Hit-test rect for the welcome hero upgrade CTA `[label]` button
     /// (click → open the promo url).
     upgrade_cta_rect: Option<&'a ratatui::layout::Rect>,
-    privacy_banner_accept_rect: Option<&'a ratatui::layout::Rect>,
-    privacy_banner_customize_rect: Option<&'a ratatui::layout::Rect>,
-    privacy_banner_legal_rect: Option<&'a ratatui::layout::Rect>,
+    privacy_banner_opt_in_rect: Option<&'a ratatui::layout::Rect>,
+    privacy_banner_opt_out_rect: Option<&'a ratatui::layout::Rect>,
+    privacy_banner_terms_rect: Option<&'a ratatui::layout::Rect>,
+    privacy_banner_policy_rect: Option<&'a ratatui::layout::Rect>,
     /// Sticky hover flag for the privacy banner buttons (redraw on
     /// enter/leave/crossing so they brighten/dim).
     on_privacy_banner: &'a mut bool,
@@ -3698,21 +3722,28 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                         xai_grok_telemetry::events::AnnouncementCtaSurface::Welcome,
                     ));
                 }
-                if let Some(rect) = ctx.privacy_banner_accept_rect
+                if let Some(rect) = ctx.privacy_banner_opt_in_rect
                     && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                 {
-                    return InputOutcome::Action(Action::PrivacyBannerAccept);
+                    return InputOutcome::Action(Action::PrivacyBannerOptIn);
                 }
-                if let Some(rect) = ctx.privacy_banner_customize_rect
+                if let Some(rect) = ctx.privacy_banner_opt_out_rect
                     && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                 {
-                    return InputOutcome::Action(Action::PrivacyBannerCustomize);
+                    return InputOutcome::Action(Action::PrivacyBannerOptOut);
                 }
-                if let Some(rect) = ctx.privacy_banner_legal_rect
+                if let Some(rect) = ctx.privacy_banner_terms_rect
                     && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                 {
                     return InputOutcome::Action(Action::OpenUrl(
-                        crate::views::privacy_banner::PRIVACY_BANNER_LEGAL_URL.to_string(),
+                        crate::views::privacy_banner::PRIVACY_BANNER_TERMS_URL.to_string(),
+                    ));
+                }
+                if let Some(rect) = ctx.privacy_banner_policy_rect
+                    && rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                {
+                    return InputOutcome::Action(Action::OpenUrl(
+                        crate::views::privacy_banner::PRIVACY_BANNER_POLICY_URL.to_string(),
                     ));
                 }
                 if let Some(rect) = ctx.changelog_cta_rect
@@ -3794,13 +3825,16 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     return InputOutcome::Changed;
                 }
                 let over_banner = ctx
-                    .privacy_banner_accept_rect
+                    .privacy_banner_opt_in_rect
                     .is_some_and(|r| r.contains(pos))
                     || ctx
-                        .privacy_banner_customize_rect
+                        .privacy_banner_opt_out_rect
                         .is_some_and(|r| r.contains(pos))
                     || ctx
-                        .privacy_banner_legal_rect
+                        .privacy_banner_terms_rect
+                        .is_some_and(|r| r.contains(pos))
+                    || ctx
+                        .privacy_banner_policy_rect
                         .is_some_and(|r| r.contains(pos));
                 if over_banner || *ctx.on_privacy_banner {
                     *ctx.on_privacy_banner = over_banner;
@@ -4348,13 +4382,19 @@ impl AppView {
                         self.welcome_refresh_rect = result.refresh_rect;
                         self.welcome_gate_url_rect = result.gate_url_rect;
                         self.welcome_upgrade_cta_rect = result.upgrade_cta_rect;
-                        self.welcome_privacy_banner_accept_rect = result.privacy_banner_accept_rect;
-                        self.welcome_privacy_banner_customize_rect =
-                            result.privacy_banner_customize_rect;
-                        self.welcome_privacy_banner_legal_rect = result.privacy_banner_legal_rect;
+                        self.welcome_privacy_banner_opt_in_rect = result.privacy_banner_opt_in_rect;
+                        self.welcome_privacy_banner_opt_out_rect =
+                            result.privacy_banner_opt_out_rect;
+                        self.welcome_privacy_banner_terms_rect = result.privacy_banner_terms_rect;
+                        self.welcome_privacy_banner_policy_rect = result.privacy_banner_policy_rect;
                         self.welcome_changelog_cta_rect = result.changelog_cta_rect;
                         if let Some((ref msg, _)) = self.welcome_toast {
-                            paint_welcome_toast(f.buffer_mut(), view_area, msg);
+                            paint_welcome_toast(
+                                f.buffer_mut(),
+                                view_area,
+                                msg,
+                                self.welcome_prompt_rect,
+                            );
                         }
                         self.welcome_announcement.truncated = result.announcement_truncated;
                         self.welcome_announcement.rect = result.announcement_rect;
@@ -4538,7 +4578,7 @@ impl AppView {
                                 !privacy_banner && self.tip.is_some() && agent.should_show_tip();
                             let has_mode_banner = agent.mode_switch_banner.is_some();
                             let banner_height = if privacy_banner {
-                                2
+                                crate::views::privacy_banner::MIN_HEIGHT
                             } else if has_mode_banner {
                                 1
                             } else if announcement_banner_h > 0 {
@@ -5738,7 +5778,8 @@ pub(crate) mod tests {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_accept_inflight: false,
+            privacy_banner_opt_in_inflight: false,
+            coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
@@ -5781,9 +5822,10 @@ pub(crate) mod tests {
             welcome_refresh_rect: None,
             welcome_gate_url_rect: None,
             welcome_upgrade_cta_rect: None,
-            welcome_privacy_banner_accept_rect: None,
-            welcome_privacy_banner_customize_rect: None,
-            welcome_privacy_banner_legal_rect: None,
+            welcome_privacy_banner_opt_in_rect: None,
+            welcome_privacy_banner_opt_out_rect: None,
+            welcome_privacy_banner_terms_rect: None,
+            welcome_privacy_banner_policy_rect: None,
             welcome_toast: None,
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
@@ -10027,9 +10069,10 @@ pub(crate) mod tests {
     fn welcome_privacy_banner_hover_triggers_redraw() {
         let mut app = test_app();
         app.active_view = ActiveView::Welcome;
-        app.welcome_privacy_banner_accept_rect = Some(ratatui::layout::Rect::new(50, 10, 8, 1));
-        app.welcome_privacy_banner_customize_rect = Some(ratatui::layout::Rect::new(25, 10, 24, 1));
-        app.welcome_privacy_banner_legal_rect = Some(ratatui::layout::Rect::new(2, 11, 45, 1));
+        app.welcome_privacy_banner_opt_in_rect = Some(ratatui::layout::Rect::new(50, 10, 8, 1));
+        app.welcome_privacy_banner_opt_out_rect = Some(ratatui::layout::Rect::new(25, 10, 24, 1));
+        app.welcome_privacy_banner_terms_rect = Some(ratatui::layout::Rect::new(7, 11, 5, 1));
+        app.welcome_privacy_banner_policy_rect = Some(ratatui::layout::Rect::new(17, 11, 14, 1));
         let over = left_mouse(MouseEventKind::Moved, 52, 10);
         assert!(matches!(app.handle_input(&over), InputOutcome::Changed));
         assert!(app.welcome_on_privacy_banner);
