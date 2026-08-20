@@ -32,9 +32,10 @@ const READ_LIVENESS_TIMEOUT_SECS: u64 = 4 * KEEPALIVE_INTERVAL_SECS;
 /// Upper bound on a single auth-recovery attempt — a backstop against an
 /// indefinitely wedged relay loop, NOT a bound on a healthy refresh. It must
 /// stay comfortably above the refresh path's own internal worst case so it
-/// only fires when something is truly stuck: `refresh_chain` waits up to 45s
-/// for `auth.json.lock` (`REFRESH_LOCK_TIMEOUT`) before IdP IO, which has its
-/// own timeouts (30s external refresher; 10–15s per OIDC request with short
+/// only fires when something is truly stuck: `refresh_chain` waits up to 25s
+/// for `auth.json.lock` (`REFRESH_LOCK_TIMEOUT`) before IdP IO — plus another
+/// 25s if the suspend-only revalidate re-acquires — and the IdP IO has its
+/// own timeouts (7s external refresher; 15s per OIDC request with short
 /// retries). When this fires the recovery future is dropped (the file lock
 /// releases on drop) and the loop falls through to reconnect backoff, which
 /// retries recovery on the next 401.
@@ -82,7 +83,7 @@ impl RelayConfig {
     }
 }
 /// Callback type for first connection event.
-pub type FirstConnectCallback = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type FirstConnectCallback = Box<dyn FnOnce() + Send + 'static>;
 /// Handle to a running relay connection.
 ///
 /// The relay maintains a persistent WebSocket connection to grok.com with
@@ -130,7 +131,7 @@ pub fn spawn_relay_connection(
 ///
 /// Same as `spawn_relay_connection` but allows providing a callback that will be
 /// called once when the first successful connection is established.
-pub fn spawn_relay_connection_with_callback(
+pub(crate) fn spawn_relay_connection_with_callback(
     config: RelayConfig,
     to_agent_tx: mpsc::UnboundedSender<String>,
     parent_cancel: Option<CancellationToken>,
@@ -209,7 +210,7 @@ async fn attempt_auth_recovery(
                 None,
                 Some(serde_json::json!({
                     "context": context,
-                    "key_prefix": crate::auth::token_suffix(&new_auth.key),
+                    "key_prefix": xai_grok_auth::bearer_suffix(&new_auth.key),
                 })),
             );
             false
@@ -221,7 +222,7 @@ async fn attempt_auth_recovery(
                 None,
                 Some(serde_json::json!({
                     "context": context,
-                    "new_key_prefix": crate::auth::token_suffix(&new_auth.key),
+                    "new_key_prefix": xai_grok_auth::bearer_suffix(&new_auth.key),
                 })),
             );
             config.auth = new_auth;

@@ -421,7 +421,7 @@ async fn annotation_actor_suppresses_start_and_both_end_hook_paths() {
                 HookEventName::Stop,
             ] {
                 assert!(
-                    !actor.hook_event_active(event),
+                    !actor.may_have_hooks_for(event),
                     "annotation policy must dominate registered client and file hooks for {event}"
                 );
             }
@@ -444,6 +444,7 @@ async fn annotation_actor_suppresses_start_and_both_end_hook_paths() {
                         HookEventName::SessionEnd,
                         HookPayload::SessionEnd {
                             reason: reason.to_string(),
+                            subagent_type: None,
                             turn_count: None,
                             tool_call_count: None,
                         },

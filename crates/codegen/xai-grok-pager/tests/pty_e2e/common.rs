@@ -47,6 +47,19 @@ pub(crate) const PROMPT: &str = "go";
 /// unambiguous sentinel word that we can `wait_for_text` on.
 pub(crate) const MOCK_RESPONSE_SENTINEL: &str = "MOCKRESPONSE";
 
+/// The sandbox's unified log (shell-written; forwarded pager entries land
+/// here too). No cross-process helper exists to reuse whole:
+/// `xai_grok_telemetry::unified_log::path()` resolves the calling process's
+/// own grok home and the file-name const is private, so this composes the
+/// sandbox grok home with the exported `LOG_DIR`.
+pub(crate) fn unified_log_path(content: &ContentController) -> PathBuf {
+    content
+        .sandbox()
+        .grok_home()
+        .join(xai_grok_telemetry::unified_log::LOG_DIR)
+        .join("unified.jsonl")
+}
+
 // ── Undo-tip e2e helpers ────────────────────────────────────────────────
 
 /// Suffix of the undo-tip banner, now "Input cleared · ctrl+z to undo" on all
@@ -1248,6 +1261,34 @@ pub(crate) fn write_cast_if_requested(harness: &PtyHarness, file_name: &str) {
     match harness.write_cast(&path) {
         Ok(()) => eprintln!("wrote cast: {}", path.display()),
         Err(e) => eprintln!("failed to write cast {}: {e}", path.display()),
+    }
+}
+
+/// Dump the current screen (plain text and HTML) into
+/// `$GROK_PTY_CAST_DIR/<file_stem>.{txt,html}` when the env var is set.
+/// Failures are logged, never fatal — same opt-in as
+/// [`write_cast_if_requested`].
+pub(crate) fn write_screen_dump_if_requested(harness: &PtyHarness, file_stem: &str) {
+    let Ok(dir) = std::env::var("GROK_PTY_CAST_DIR") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create dump dir {}: {e}", dir.display());
+        return;
+    }
+    for (ext, body) in [
+        ("txt", harness.screen_contents()),
+        ("html", harness.screen_html()),
+    ] {
+        let path = dir.join(format!("{file_stem}.{ext}"));
+        match std::fs::write(&path, body) {
+            Ok(()) => eprintln!("wrote screen dump: {}", path.display()),
+            Err(e) => eprintln!("failed to write screen dump {}: {e}", path.display()),
+        }
     }
 }
 

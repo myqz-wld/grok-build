@@ -1736,6 +1736,7 @@ mod tests {
             screen_x: 4,
             selectable_cols: 0..selectable_width,
             text: derive_selection_text(line),
+            painted_region: None,
             joiner_to_previous: None,
         });
         model.visible_blocks.push(VisibleBlockGeometry {

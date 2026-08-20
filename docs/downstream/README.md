@@ -13,7 +13,7 @@ policy is:
 
 | Feature | Status | Upstream base | User documentation | Design / execution plan |
 |---|---|---|---|---|
-| Persistent threaded inline annotations | Implemented on `feature/inline-annotations` | `ba76b0a` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
+| Persistent threaded inline annotations | Maintained on `downstream/main` | `19d42e3` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
 
 ### Inline annotations
 

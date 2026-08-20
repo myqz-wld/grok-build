@@ -523,7 +523,7 @@ fn manager_collection_predicates_fail_directions() {
     );
 }
 
-// -- token_suffix ----------------------------------------------------------------
+// -- bearer_suffix ----------------------------------------------------------------
 
 #[test]
 fn token_suffix_matrix() {
@@ -534,7 +534,7 @@ fn token_suffix_matrix() {
         ("123456789012", "123456789012"),     // exact 12
     ];
     for (input, expected) in cases {
-        assert_eq!(token_suffix(input), *expected, "input={input:?}");
+        assert_eq!(bearer_suffix(input), *expected, "input={input:?}");
     }
 }
 
@@ -582,9 +582,10 @@ fn try_use_disk_token_rejects_expired_disk_token() {
     let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
 
     let expired_disk = make_auth(Some(Utc::now() - Duration::hours(1)), Utc::now());
-    assert!(
+    assert_eq!(
         mgr.try_use_disk_token(Some(&expired_disk), RefreshReason::PreRequest)
-            .is_none()
+            .err(),
+        Some(DiskTokenDecline::Expired)
     );
 }
 
@@ -601,9 +602,10 @@ fn try_use_disk_token_rejects_same_key_on_server_rejected() {
     mgr.hot_swap(auth.clone());
 
     // ServerRejected should not accept a disk token with the same key
-    assert!(
+    assert_eq!(
         mgr.try_use_disk_token(Some(&auth), RefreshReason::ServerRejected)
-            .is_none()
+            .err(),
+        Some(DiskTokenDecline::SameKeyAsRejected)
     );
 }
 
@@ -625,6 +627,113 @@ fn try_use_disk_token_accepts_different_key_on_server_rejected() {
     };
     let result = mgr.try_use_disk_token(Some(&disk_auth), RefreshReason::ServerRejected);
     assert_eq!(result.unwrap().key, "new-key");
+}
+
+/// Disk lagging memory (`update()` kept a mint after a failed disk write) is
+/// not a sibling rotation: a valid disk token minted BEFORE the live
+/// in-memory one must not clobber it — on ServerRejected that would restore
+/// the very bearer the caller is rejecting.
+#[test]
+fn try_use_disk_token_skips_disk_token_older_than_memory_mint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    let fresh_mint = GrokAuth {
+        key: "fresh-mint".into(),
+        ..make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now())
+    };
+    mgr.hot_swap(fresh_mint);
+
+    let lagging_disk = GrokAuth {
+        key: "stale-disk".into(),
+        ..make_auth(
+            Some(Utc::now() + Duration::minutes(30)),
+            Utc::now() - Duration::hours(1),
+        )
+    };
+    for reason in [RefreshReason::PreRequest, RefreshReason::ServerRejected] {
+        assert_eq!(
+            mgr.try_use_disk_token(Some(&lagging_disk), reason).err(),
+            Some(DiskTokenDecline::LaggingMemoryMint),
+            "an older disk token must not clobber the in-memory mint ({reason:?})"
+        );
+        assert_eq!(mgr.current().unwrap().key, "fresh-mint");
+    }
+}
+
+/// The lagging-mint guard must hold when the in-memory bearer sits inside
+/// the early-invalidation buffer — the exact state that routes a refresh
+/// into the adopt paths. `current()` hides a buffered bearer, so a
+/// `current()`-gated guard was skipped in precisely that window and a
+/// lagging disk token could clobber the newest local mint.
+#[test]
+fn try_use_disk_token_lagging_guard_holds_for_buffered_in_memory_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    // Inside the 5-minute buffer: hidden by `current()`, visible to
+    // `current_or_expired()`, still the newest local mint.
+    let buffered_mint = GrokAuth {
+        key: "buffered-mint".into(),
+        ..make_auth(Some(Utc::now() + Duration::minutes(2)), Utc::now())
+    };
+    mgr.hot_swap(buffered_mint);
+    assert!(mgr.current().is_none(), "bearer is inside the buffer");
+
+    let lagging_disk = GrokAuth {
+        key: "stale-disk".into(),
+        ..make_auth(
+            Some(Utc::now() + Duration::minutes(30)),
+            Utc::now() - Duration::hours(1),
+        )
+    };
+    for reason in [RefreshReason::PreRequest, RefreshReason::ServerRejected] {
+        assert_eq!(
+            mgr.try_use_disk_token(Some(&lagging_disk), reason).err(),
+            Some(DiskTokenDecline::LaggingMemoryMint),
+            "a buffered bearer is still the newest mint ({reason:?})"
+        );
+        assert_eq!(mgr.current_or_expired().unwrap().key, "buffered-mint");
+    }
+}
+
+/// `pick_up_sibling_token` routes through the shared enforcement point, so
+/// it refuses a lagging disk token instead of replacing a newer in-memory
+/// mint with it (previously it checked expiry + key only and wrote state
+/// directly).
+#[test]
+fn pick_up_sibling_token_refuses_lagging_disk_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    let fresh_mint = GrokAuth {
+        key: "fresh-mint".into(),
+        ..make_auth(Some(Utc::now() + Duration::hours(1)), Utc::now())
+    };
+    mgr.hot_swap(fresh_mint);
+
+    // Valid, different key, but minted an hour before the in-memory token:
+    // disk lagging memory, not a sibling rotation.
+    let lagging_disk = GrokAuth {
+        key: "stale-disk".into(),
+        ..make_auth(
+            Some(Utc::now() + Duration::minutes(30)),
+            Utc::now() - Duration::hours(1),
+        )
+    };
+    let mut store = AuthStore::new();
+    store.insert(scope, lagging_disk);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    assert!(
+        !mgr.pick_up_sibling_token(),
+        "a lagging disk token is not an adoption"
+    );
+    assert_eq!(mgr.current().unwrap().key, "fresh-mint");
 }
 
 // -- File locking ----------------------------------------------------------
@@ -727,6 +836,348 @@ fn record_permanent_failure(
         .map(|a| a.key)
         .unwrap_or_default();
     auth_manager.record_permanent_failure(key, reason.into());
+}
+
+/// A convoy member whose sibling already rotated the token must adopt it
+/// BEFORE contending the flock: with the flock held elsewhere for the whole
+/// call, `refresh_chain` still returns the sibling token promptly, with no
+/// IdP call.
+#[tokio::test]
+async fn refresh_chain_adopts_sibling_pre_lock_without_flock() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    mgr.hot_swap(GrokAuth {
+        key: "expired-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("old-rt".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    let fresh_disk = GrokAuth {
+        key: "fresh-key-from-sibling".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("new-rt".into()),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    };
+    let mut store = AuthStore::new();
+    store.insert(scope, fresh_disk);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: calls.clone(),
+        delay: StdDuration::ZERO,
+    }));
+
+    // Hold the flock for the whole call through the production acquisition
+    // path, so live holder info is on disk and the waiter's stale-break
+    // machinery cannot void the hold.
+    let _held = mgr
+        .try_lock_auth_file_async(REFRESH_LOCK_TIMEOUT)
+        .await
+        .expect("uncontended first acquisition");
+
+    let adopted = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        mgr.refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest),
+    )
+    .await
+    .expect("pre-lock adoption must not wait on the held flock")
+    .expect("adoption returns the sibling token");
+    assert_eq!(adopted.key, "fresh-key-from-sibling");
+    assert_eq!(mgr.current().unwrap().key, "fresh-key-from-sibling");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a pure adoption must not reach the IdP"
+    );
+}
+
+/// ServerRejected with the disk token identical to the rejected one must NOT
+/// adopt pre-lock: the caller needs a genuinely new credential, so it falls
+/// through to a locked mint.
+#[tokio::test]
+async fn refresh_chain_server_rejected_same_key_skips_pre_lock_adopt() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    let rejected = GrokAuth {
+        key: "rejected-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-live".into()),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    };
+    mgr.hot_swap(rejected.clone());
+    let mut store = AuthStore::new();
+    store.insert(scope, rejected);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: calls.clone(),
+        delay: StdDuration::ZERO,
+    }));
+
+    let minted = mgr
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .expect("locked mint");
+    assert_eq!(minted.key, "fresh-token");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a same-key disk token must mint under the flock"
+    );
+}
+
+/// A buffered-expired sibling token on disk is not adoptable: the pre-lock
+/// check declines and the chain mints under the flock, so adoption can never
+/// hand back a token the next request would immediately re-refresh.
+#[tokio::test]
+async fn refresh_chain_pre_lock_adopt_ignores_expired_disk_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    mgr.hot_swap(GrokAuth {
+        key: "expired-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("old-rt".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    // Inside the 5-minute early-invalidation buffer: wire-alive but not
+    // adoptable per `try_use_disk_token`'s buffer-inclusive expiry check.
+    let buffered_disk = GrokAuth {
+        key: "buffered-sibling-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-buffered".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(3)),
+        ..GrokAuth::test_default()
+    };
+    let mut store = AuthStore::new();
+    store.insert(scope, buffered_disk);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: calls.clone(),
+        delay: StdDuration::ZERO,
+    }));
+
+    let minted = mgr
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect("locked mint");
+    assert_eq!(minted.key, "fresh-token");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a buffered-expired disk token must not be adopted"
+    );
+}
+
+/// Disk lagging memory must not be "adopted" pre-lock: with a live mint in
+/// memory and an older still-valid token on disk (`update()` disk write
+/// failed), `refresh_chain` returns the in-memory mint untouched instead of
+/// hot-swapping the older bearer back in.
+#[tokio::test]
+async fn refresh_chain_pre_lock_adopt_skips_disk_token_older_than_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    let lagging_disk = GrokAuth {
+        key: "stale-disk-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-old".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(30)),
+        create_time: Utc::now() - Duration::hours(1),
+        ..GrokAuth::test_default()
+    };
+    let mut store = AuthStore::new();
+    store.insert(scope, lagging_disk);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    mgr.hot_swap(GrokAuth {
+        key: "fresh-mint-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-new".into()),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: calls.clone(),
+        delay: StdDuration::ZERO,
+    }));
+
+    let auth = mgr
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .expect("in-memory mint is returned");
+    assert_eq!(auth.key, "fresh-mint-key");
+    assert_eq!(mgr.current().unwrap().key, "fresh-mint-key");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "neither adoption nor a mint may replace the fresher in-memory token"
+    );
+}
+
+/// Same lagging-disk guard on its only reachable step-1c path: with a valid
+/// in-memory token, `PreRequest` short-circuits at step 1, so only
+/// `ServerRejected` carries a live mint into the pre-lock adopt. A
+/// different-key disk token minted well before the rejected one must not be
+/// adopted — the chain mints under the flock instead.
+#[tokio::test]
+async fn refresh_chain_server_rejected_skips_lagging_disk_token_pre_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = GrokComConfig::default();
+    let scope = cfg.auth_scope();
+    let mgr = Arc::new(AuthManager::new(dir.path(), cfg));
+
+    // Past the 60s skew tolerance, so this is unambiguously disk-lagging.
+    let lagging_disk = GrokAuth {
+        key: "stale-disk-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-old".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(30)),
+        create_time: Utc::now() - Duration::minutes(10),
+        ..GrokAuth::test_default()
+    };
+    let mut store = AuthStore::new();
+    store.insert(scope, lagging_disk);
+    write_auth_json(&dir.path().join("auth.json"), &store).unwrap();
+
+    mgr.hot_swap(GrokAuth {
+        key: "rejected-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-live".into()),
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+
+    let calls = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: calls.clone(),
+        delay: StdDuration::ZERO,
+    }));
+
+    let minted = mgr
+        .refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+        .await
+        .expect("locked mint");
+    assert_eq!(minted.key, "fresh-token");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a lagging disk token must not be adopted in place of the rejected mint"
+    );
+}
+
+/// The bounded wrapper returns a transient error at the deadline WITHOUT
+/// dropping the mint: the spawned chain finishes afterwards, hot-swaps the
+/// minted token, and persists it to disk, so the rotated refresh token is
+/// never abandoned and siblings can adopt it.
+#[tokio::test]
+async fn refresh_chain_bounded_times_out_without_dropping_mint() {
+    /// Signals just before returning `Success`, so the test can await the
+    /// mint's completion instead of polling on a scheduler-dependent clock.
+    struct SlowSignallingRefresher {
+        call_count: Arc<AtomicU32>,
+        returning: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl TokenRefresher for SlowSignallingRefresher {
+        async fn refresh(&self, _reason: RefreshReason) -> crate::auth::refresh::RefreshOutcome {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            // Far past the caller's 250ms budget, so the early return below
+            // cannot race a fast mint on a loaded shard.
+            tokio::time::sleep(StdDuration::from_secs(5)).await;
+            let fresh = GrokAuth {
+                key: "fresh-token".into(),
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+                refresh_token: Some("rt-new".into()),
+                ..GrokAuth::test_default()
+            };
+            self.returning.notify_one();
+            crate::auth::refresh::RefreshOutcome::Success(Box::new(fresh))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+
+    mgr.hot_swap(GrokAuth {
+        key: "expired-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("old-rt".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let returning = Arc::new(tokio::sync::Notify::new());
+    mgr.set_refresher(Arc::new(SlowSignallingRefresher {
+        call_count: calls.clone(),
+        returning: returning.clone(),
+    }));
+
+    let started = Instant::now();
+    let result = mgr
+        .refresh_chain_bounded(
+            TokenType::OidcSession,
+            RefreshReason::PreRequest,
+            StdDuration::from_millis(250),
+        )
+        .await;
+    let err = result.expect_err("the deadline elapses before the slow mint");
+    assert!(err.is_transient(), "the deadline maps to a retryable error");
+    assert!(
+        err.to_string().contains("bounded refresh deadline elapsed"),
+        "timeout arm, not a refresh failure: {err}"
+    );
+    assert!(
+        started.elapsed() < StdDuration::from_secs(5),
+        "the caller returns at ~budget, not the refresher's sleep"
+    );
+
+    // The detached chain keeps driving the refresher to completion...
+    tokio::time::timeout(StdDuration::from_secs(30), returning.notified())
+        .await
+        .expect("the spawned refresh_chain must run the refresher to completion");
+    // ...then persists + hot-swaps on the same task; only that short tail
+    // needs a bounded wait.
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while mgr.current().map(|a| a.key).as_deref() != Some("fresh-token") {
+        assert!(
+            Instant::now() < deadline,
+            "mint must be hot-swapped after the refresher returns"
+        );
+        tokio::time::sleep(StdDuration::from_millis(25)).await;
+    }
+    assert_eq!(
+        mgr.read_disk_auth().map(|a| a.key).as_deref(),
+        Some("fresh-token"),
+        "mint must be persisted for sibling adoption, not only hot-swapped"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one IdP call: bounded return must not re-mint"
+    );
 }
 
 /// With `inner == None` but a dead refresh-token on disk, the refresher still
@@ -1176,13 +1627,10 @@ async fn proactive_refresh_backs_off_on_permanent_failure() {
     let cancel = CancellationToken::new();
     mgr.start_proactive_refresh(cancel.clone());
 
-    // Give the loop ample time to observe the failure and back off.
-    // The 300ms window is two orders of magnitude shorter than the
-    // 5-minute BACKOFF_INTERVAL, so a backed-off loop completes at
-    // most a couple of iterations: the initial pass that records the
-    // permanent failure, optionally a few re-check passes if the
-    // executor races, then sleeps for `BACKOFF_INTERVAL`.
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    // Window: past the PROACTIVE_MIN_SLEEP-delayed first pass, yet two
+    // orders of magnitude under BACKOFF_INTERVAL — a backed-off loop
+    // completes at most a couple of iterations in it.
+    tokio::time::sleep(PROACTIVE_MIN_SLEEP + StdDuration::from_millis(500)).await;
 
     let iterations = mgr.proactive_iteration_count();
     let after_failure = call_count.load(Ordering::SeqCst);
@@ -1289,7 +1737,9 @@ async fn proactive_refresh_and_consumer_see_fresh_token_end_to_end() {
 
     let cancel = CancellationToken::new();
     mgr.start_proactive_refresh(cancel.clone());
-    tokio::time::sleep(StdDuration::from_millis(500)).await;
+    // The loop's first pass runs after PROACTIVE_MIN_SLEEP (1 s), so the
+    // observation window must comfortably exceed the floor.
+    tokio::time::sleep(PROACTIVE_MIN_SLEEP + StdDuration::from_millis(1000)).await;
 
     assert!(call_count.load(Ordering::SeqCst) >= 1);
     assert_eq!(mgr.get_valid_token().await.unwrap(), "fresh-token");
@@ -2068,8 +2518,8 @@ fn compute_proactive_sleep_sleep_gated_returns_backoff() {
     });
     assert_eq!(
         compute_proactive_sleep(&mgr),
-        StdDuration::from_secs(0),
-        "precondition: ungated expired refreshable token yields a 0 sleep"
+        PROACTIVE_MIN_SLEEP,
+        "precondition: ungated expired refreshable token yields the floor sleep"
     );
 
     mgr.set_system_sleep_imminent(true);
@@ -2080,10 +2530,10 @@ fn compute_proactive_sleep_sleep_gated_returns_backoff() {
     );
 }
 
-/// Dark wake -> BACKOFF_INTERVAL even for a refreshable token past its expiry.
-/// `refresh_chain` defers every attempt during a dark wake (to avoid an IdP
-/// refresh straddling an unsignaled re-sleep), so the proactive loop must back
-/// off rather than spin at `sleep_dur=0`.
+/// Dark wake -> BACKOFF_INTERVAL while a wire-valid token can still be served:
+/// `refresh_chain` defers that case, so the loop must back off rather than spin
+/// at `sleep_dur=0` against the deferral. Once nothing usable can be served the
+/// deferral stops and so does the backoff — both arms are asserted below.
 #[test]
 fn compute_proactive_sleep_dark_wake_returns_backoff() {
     let dir = tempfile::tempdir().unwrap();
@@ -2092,19 +2542,20 @@ fn compute_proactive_sleep_dark_wake_returns_backoff() {
         call_count: Arc::new(AtomicU32::new(0)),
         delay: StdDuration::from_millis(0),
     }));
-    // Refreshable OidcSession past the early-invalidation boundary: without
-    // the dark-wake gate this returns 0 (would busy-loop).
+    // Wire-valid but past the early-invalidation boundary: renewal is due, and
+    // `refresh_chain` will defer it in dark wake — so the loop must back off
+    // rather than busy-loop against that deferral.
     mgr.hot_swap(GrokAuth {
         key: "oidc".into(),
         auth_mode: AuthMode::Oidc,
         refresh_token: Some("rt".into()),
-        expires_at: Some(Utc::now() - Duration::hours(1)),
+        expires_at: Some(Utc::now() + Duration::minutes(2)),
         ..GrokAuth::test_default()
     });
     assert_eq!(
         compute_proactive_sleep(&mgr),
-        StdDuration::from_secs(0),
-        "precondition: non-dark-wake expired refreshable token yields a 0 sleep"
+        PROACTIVE_MIN_SLEEP,
+        "precondition: renewal due outside dark wake yields the floor sleep"
     );
 
     mgr.set_dark_wake_for_test(true);
@@ -2114,12 +2565,19 @@ fn compute_proactive_sleep_dark_wake_returns_backoff() {
         "dark wake must back the proactive loop off instead of busy-looping"
     );
 
-    // Returning to a full wake re-enables immediate refresh.
-    mgr.set_dark_wake_for_test(false);
+    // Hard-expired: `refresh_chain` no longer defers, so backing off here would
+    // strand the session for a full interval.
+    mgr.hot_swap(GrokAuth {
+        key: "oidc".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
     assert_eq!(
         compute_proactive_sleep(&mgr),
-        StdDuration::from_secs(0),
-        "full wake must allow the refresh to proceed again"
+        PROACTIVE_MIN_SLEEP,
+        "dark wake must not delay recovery when no usable token can be served"
     );
 }
 
@@ -2161,10 +2619,11 @@ fn compute_proactive_sleep_refreshable_no_expiry_returns_backoff() {
     assert_eq!(compute_proactive_sleep(&mgr), BACKOFF_INTERVAL);
 }
 
-/// Refreshable type + `Some(past)` and gates pass -> sleep_dur = 0
-/// (refresh now). This is the "happy path" the gates don't block.
+/// Refreshable type + `Some(past)` and gates pass -> the floor sleep
+/// (refresh on the next pass; floored so the adopt/skip fast paths can't
+/// spin). This is the "happy path" the gates don't block.
 #[test]
-fn compute_proactive_sleep_refreshable_past_expiry_returns_zero() {
+fn compute_proactive_sleep_refreshable_past_expiry_returns_floor() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
     mgr.set_refresher(Arc::new(CountingRefresher {
@@ -2179,7 +2638,7 @@ fn compute_proactive_sleep_refreshable_past_expiry_returns_zero() {
         ..GrokAuth::test_default()
     });
     assert_eq!(mgr.token_type(), TokenType::OidcSession);
-    assert_eq!(compute_proactive_sleep(&mgr), StdDuration::from_secs(0));
+    assert_eq!(compute_proactive_sleep(&mgr), PROACTIVE_MIN_SLEEP);
 }
 
 /// Refreshable type + `Some(future)` and gates pass -> sleep_dur ~=
@@ -4213,20 +4672,32 @@ async fn sleep_deferred_refresh_is_transient_no_kpi_no_verdict() {
     );
 }
 
+/// Dark wake defers a refresh only while a *wire-valid* token can still be
+/// served — then the deferral costs nothing but latency.
 #[tokio::test]
-async fn dark_wake_defers_refresh_without_calling_idp() {
+async fn dark_wake_defers_refresh_while_a_live_token_can_be_served() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-    mgr.hot_swap(expired_oidc());
+    // Inside the early-invalidation buffer: due for renewal (`current()` is
+    // None, so `refresh_chain` proceeds) but still accepted on the wire.
+    mgr.hot_swap(GrokAuth {
+        key: "live-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-old".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(2)),
+        ..GrokAuth::test_default()
+    });
     let call_count = Arc::new(AtomicU32::new(0));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: call_count.clone(),
         delay: StdDuration::from_millis(0),
     }));
-
     mgr.set_dark_wake_for_test(true);
 
-    let err = mgr.auth().await.unwrap_err();
+    let err = mgr
+        .refresh_chain(TokenType::OidcSession, RefreshReason::PreRequest)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -4237,18 +4708,65 @@ async fn dark_wake_defers_refresh_without_calling_idp() {
     assert_eq!(
         call_count.load(Ordering::SeqCst),
         0,
-        "the IdP refresher must NOT be called during a dark wake (the refresh \
-         token must not be sent into a possible re-sleep)"
+        "with a live token to serve, the refresh token must not be sent into a \
+         possible re-sleep"
     );
+}
 
-    // Returning to a full wake lets the refresh proceed and reach the IdP.
-    mgr.set_dark_wake_for_test(false);
-    assert_eq!(mgr.auth().await.unwrap().key, "fresh-token");
+/// The inverse, and the one field logs caught: with **no** usable token, a
+/// dark-wake deferral guarantees the caller 401s instead of merely delaying it.
+/// A machine doing background work with the lid shut (leader mode + subagents)
+/// accumulated hundreds of 401s across hours of continuous dark wake while
+/// every recovery refresh was deferred. Refresh must proceed in that state.
+#[tokio::test]
+async fn dark_wake_does_not_defer_when_no_usable_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    mgr.hot_swap(expired_oidc());
+    let call_count = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: call_count.clone(),
+        delay: StdDuration::from_millis(0),
+    }));
+    mgr.set_dark_wake_for_test(true);
+
     assert_eq!(
-        call_count.load(Ordering::SeqCst),
-        1,
-        "after a full wake the refresher must be invoked"
+        mgr.auth().await.unwrap().key,
+        "fresh-token",
+        "an expired credential in dark wake must still be refreshed"
     );
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+}
+
+/// A 401 recovery is never deferred for dark wake: the server already rejected
+/// what we hold, so deferring can only prolong the failure.
+#[tokio::test]
+async fn dark_wake_does_not_defer_server_rejected_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    mgr.hot_swap(GrokAuth {
+        key: "rejected-but-unexpired".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-old".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(2)),
+        ..GrokAuth::test_default()
+    });
+    let call_count = Arc::new(AtomicU32::new(0));
+    mgr.set_refresher(Arc::new(CountingRefresher {
+        call_count: call_count.clone(),
+        delay: StdDuration::from_millis(0),
+    }));
+    mgr.set_dark_wake_for_test(true);
+
+    assert_eq!(
+        mgr.refresh_chain(TokenType::OidcSession, RefreshReason::ServerRejected)
+            .await
+            .unwrap()
+            .key,
+        "fresh-token",
+        "ServerRejected recovery must reach the IdP even in dark wake"
+    );
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
 }
 
 /// A machine stuck reporting a *continuous* dark wake (e.g. an interactive Mac
@@ -4260,7 +4778,15 @@ async fn dark_wake_defers_refresh_without_calling_idp() {
 async fn dark_wake_defer_forces_refresh_after_max() {
     let dir = tempfile::tempdir().unwrap();
     let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
-    mgr.hot_swap(expired_oidc());
+    // Wire-valid but due for renewal, so the deferral path (and its budget) is
+    // the thing under test — a hard-expired token is never deferred at all.
+    mgr.hot_swap(GrokAuth {
+        key: "live-key".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-old".into()),
+        expires_at: Some(Utc::now() + Duration::minutes(2)),
+        ..GrokAuth::test_default()
+    });
     let call_count = Arc::new(AtomicU32::new(0));
     mgr.set_refresher(Arc::new(CountingRefresher {
         call_count: call_count.clone(),
@@ -4278,7 +4804,7 @@ async fn dark_wake_defer_forces_refresh_after_max() {
     ) else {
         return; // machine/clock can't represent the backdate — skip
     };
-    *mgr.dark_wake_defer_since.write() = Some(super::sleep_gate::GateRaise { mono, wall });
+    *mgr.dark_wake_defer_since.write() = Some(crate::util::dual_clock::DualClock { mono, wall });
 
     assert_eq!(
         mgr.auth().await.unwrap().key,
@@ -4332,17 +4858,51 @@ fn dark_wake_defer_budget_survives_powered_on_during_dark_wake() {
 }
 
 /// The `power_listener_started` guard in `is_dark_wake` must short-circuit to
-/// `false` when no OS power listener was started (headless / datacenter), so
+/// `false` when no OS power listener was started (headless / server), so
 /// those processes never treat the OS power state as a dark wake. Exercises the
 /// guard directly (no dark-wake override installed).
 #[test]
+#[serial_test::serial(force_dark_wake_env)] // reads GROK_AUTH_FORCE_DARK_WAKE
 fn is_dark_wake_false_when_power_listener_not_started() {
+    let _unset = xai_grok_test_support::EnvGuard::unset("GROK_AUTH_FORCE_DARK_WAKE");
     let dir = tempfile::tempdir().unwrap();
     let mgr = AuthManager::new(dir.path(), GrokComConfig::default());
     assert!(
         !mgr.is_dark_wake(),
         "is_dark_wake must be false when the power listener was never started"
     );
+}
+
+/// `GROK_AUTH_FORCE_DARK_WAKE` forces the dark-wake answer for manual and
+/// integration testing — read BEFORE the `power_listener_started` check,
+/// because a headless run never starts the listener and the override
+/// exists precisely so such a run can drive the dark-wake paths against a
+/// real binary.
+#[test]
+#[serial_test::serial(force_dark_wake_env)]
+fn is_dark_wake_env_override_forces_both_states() {
+    use xai_grok_test_support::EnvGuard;
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = AuthManager::new(dir.path(), GrokComConfig::default());
+    // Precondition: no power listener, so without the override this is
+    // unconditionally false.
+    {
+        let _g = EnvGuard::set("GROK_AUTH_FORCE_DARK_WAKE", "1");
+        assert!(
+            mgr.is_dark_wake(),
+            "=1 must force dark wake even without a power listener"
+        );
+    }
+    {
+        let _g = EnvGuard::set("GROK_AUTH_FORCE_DARK_WAKE", "0");
+        assert!(!mgr.is_dark_wake(), "=0 must force full wake");
+    }
+    {
+        // Unrecognized values fall through to the OS query (listener not
+        // started here, so false) rather than picking a state.
+        let _g = EnvGuard::set("GROK_AUTH_FORCE_DARK_WAKE", "yes");
+        assert!(!mgr.is_dark_wake(), "non-1/0 values must not force a state");
+    }
 }
 
 #[tokio::test]
@@ -4381,7 +4941,7 @@ async fn sleep_gate_auto_expires_after_max() {
     ) else {
         return; // machine/clock can't represent the backdate — not reproducible; skip
     };
-    *mgr.sleep_gate.raised_at.write() = Some(super::sleep_gate::GateRaise { mono, wall });
+    *mgr.sleep_gate.raised_at.write() = Some(crate::util::dual_clock::DualClock { mono, wall });
 
     assert!(
         !mgr.is_sleep_gated(),
@@ -4413,7 +4973,7 @@ async fn sleep_gate_auto_expires_when_wall_clock_passes_during_sleep() {
     let Some(wall) = std::time::SystemTime::now().checked_sub(back) else {
         return; // clock can't represent the backdate — not reproducible; skip
     };
-    *mgr.sleep_gate.raised_at.write() = Some(super::sleep_gate::GateRaise {
+    *mgr.sleep_gate.raised_at.write() = Some(crate::util::dual_clock::DualClock {
         mono: Instant::now(),
         wall,
     });
@@ -4597,6 +5157,12 @@ fn manual_auth_reason_maps_terminal_and_skips_non_forcing() {
         }),
         Some(R::WrongTeam)
     );
+    // Before this reason existed these lockouts hid under the self-healing
+    // `Other` bucket and never surfaced in the KPI at all.
+    assert_eq!(
+        permanent(Reason::ProviderInteractiveRequired),
+        Some(R::ProviderInteractiveRequired)
+    );
     // Self-healing (TTL) reasons, transient / no-credential, and API-key
     // lockouts (out of scope for this KPI) don't count.
     assert_eq!(permanent(Reason::ClientRejected), None);
@@ -4630,6 +5196,10 @@ fn relay_should_cancel_gives_up_only_on_terminal_failures() {
     // Cancelled even though it never emits the KPI (a kill-switched API key
     // means rotate the key, not `/login`).
     assert!(relay_should_cancel(&AuthError::ApiKeyAuthDisabled));
+    // Reconnecting would replay the same 401 until the user signs in.
+    assert!(relay_should_cancel(&AuthError::permanent(
+        Reason::ProviderInteractiveRequired
+    )));
 
     // Recoverable: fall through and reconnect.
     assert!(!relay_should_cancel(&AuthError::transient("network blip")));
@@ -4763,4 +5333,209 @@ async fn manual_auth_emits_only_for_user_facing_source() {
         .next()
         .await;
     assert!(api.manual_auth_last_token().is_none());
+}
+
+// ── requires_manual_reauth: transient-vs-terminal authority ─────────
+
+/// A refreshable credential with no sticky verdict must NOT demand a manual
+/// `/login` — this is the authority the sampler consults before painting the
+/// pager's re-auth banner, and the post-wake network gap must classify as
+/// self-healing.
+#[tokio::test]
+async fn requires_manual_reauth_false_for_refreshable_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    mgr.hot_swap(GrokAuth {
+        key: "expired-at".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-live".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    mgr.set_refresher(Arc::new(FailingRefresher {
+        call_count: Arc::new(AtomicU32::new(0)),
+    }));
+
+    assert!(
+        !mgr.requires_manual_reauth(),
+        "expired AT with a live RT and no verdict must be self-healing"
+    );
+
+    // A recoverable verdict (escalated `Other` — e.g. post-wake blips) still
+    // self-heals after its TTL, so it must not demand manual re-auth either.
+    record_permanent_failure(&mgr, crate::auth::error::RefreshTokenFailedReason::Other);
+    assert!(
+        !mgr.requires_manual_reauth(),
+        "a recoverable Other verdict must not demand /login"
+    );
+}
+
+/// A sticky `RefreshTokenRejected` verdict (IdP revoked the RT) is fixable
+/// only by `/login`; likewise a manager with no refresh authority at all.
+#[tokio::test]
+async fn requires_manual_reauth_true_for_sticky_verdict_and_no_refresher() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), GrokComConfig::default()));
+    mgr.hot_swap(GrokAuth {
+        key: "expired-at".into(),
+        auth_mode: AuthMode::Oidc,
+        refresh_token: Some("rt-dead".into()),
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+
+    // No refresher configured: nothing can silently heal the session.
+    assert!(
+        mgr.requires_manual_reauth(),
+        "no refresh authority must demand /login"
+    );
+
+    mgr.set_refresher(Arc::new(FailingRefresher {
+        call_count: Arc::new(AtomicU32::new(0)),
+    }));
+    record_permanent_failure(
+        &mgr,
+        crate::auth::error::RefreshTokenFailedReason::RefreshTokenRejected,
+    );
+    assert!(
+        mgr.requires_manual_reauth(),
+        "a sticky RefreshTokenRejected verdict must demand /login"
+    );
+}
+
+/// Treating a failed provider run as self-healing is what let an expired
+/// credential in and then 401'd every turn. The verdict still ages out, so a
+/// later launch gets to retry the provider.
+#[tokio::test]
+async fn requires_manual_reauth_true_after_external_provider_refresh_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(AuthManager::new(dir.path(), external_provider_config()));
+    mgr.hot_swap(GrokAuth {
+        key: "expired-external".into(),
+        auth_mode: AuthMode::External,
+        expires_at: Some(Utc::now() - Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    mgr.set_refresher(Arc::new(FailingRefresher {
+        call_count: Arc::new(AtomicU32::new(0)),
+    }));
+
+    assert!(
+        !mgr.requires_manual_reauth(),
+        "before any attempt the provider may still mint silently"
+    );
+
+    record_permanent_failure(
+        &mgr,
+        crate::auth::error::RefreshTokenFailedReason::ProviderInteractiveRequired,
+    );
+    assert!(
+        mgr.requires_manual_reauth(),
+        "a failed headless provider run leaves only the interactive flow"
+    );
+
+    mgr.force_permanent_failure_aged_out();
+    assert!(
+        !mgr.requires_manual_reauth(),
+        "the verdict is non-sticky: past its TTL the provider gets another chance"
+    );
+}
+
+/// Config for a deployment that mints sessions with an external binary.
+fn external_provider_config() -> GrokComConfig {
+    GrokComConfig {
+        auth_provider_command: Some("acme-auth".to_owned()),
+        ..GrokComConfig::default()
+    }
+}
+
+// ── proactive_failure_backoff ────────────────────────────────────────
+
+/// The proactive loop's failure backoff: zero before any failure (schedule is
+/// purely expiry-driven), grows with consecutive failures, and is capped so a
+/// long outage still retries at the regular cadence. Guards against the
+/// zero-delay spin that burned the OIDC escalation budget while post-wake
+/// Wi-Fi was still associating.
+#[test]
+fn proactive_failure_backoff_shape() {
+    assert_eq!(
+        crate::auth::manager::proactive_failure_backoff(0),
+        std::time::Duration::ZERO,
+        "no failures → no extra delay"
+    );
+    let b1 = crate::auth::manager::proactive_failure_backoff(1);
+    assert!(
+        b1 >= std::time::Duration::from_secs(5) && b1 < std::time::Duration::from_secs(9),
+        "first failure backs off ~5s (plus jitter), got {b1:?}"
+    );
+    let b3 = crate::auth::manager::proactive_failure_backoff(3);
+    assert!(
+        b3 >= std::time::Duration::from_secs(20) && b3 < std::time::Duration::from_secs(24),
+        "third failure backs off ~20s (plus jitter), got {b3:?}"
+    );
+    let huge = crate::auth::manager::proactive_failure_backoff(u32::MAX);
+    assert!(
+        huge <= BACKOFF_INTERVAL + std::time::Duration::from_secs(3),
+        "backoff must cap at BACKOFF_INTERVAL (+jitter), got {huge:?}"
+    );
+}
+
+// ── try_devbox_recovery: the wait-on-the-lock double-check ───────────
+
+/// Seed a credential that is locally valid but that the caller has been told
+/// the server rejects — the shape that made the double-check lie.
+fn devbox_manager(dir: &std::path::Path, key: &str) -> Arc<AuthManager> {
+    let mgr = Arc::new(AuthManager::new(dir, GrokComConfig::default()));
+    mgr.set_devbox_env_for_test(true);
+    mgr.hot_swap(GrokAuth {
+        key: key.into(),
+        auth_mode: AuthMode::External,
+        expires_at: Some(Utc::now() + Duration::hours(1)),
+        ..GrokAuth::test_default()
+    });
+    mgr
+}
+
+/// The credential the caller already knows is dead can never be the answer.
+///
+/// `try_devbox_recovery` short-circuits on whatever `current()` holds, to
+/// catch a sibling task that refreshed while we waited on `refresh_lock`.
+/// Told nothing about the rejected bearer it used to return that bearer, so
+/// on a devbox every 401 against a still-locally-valid token reported
+/// "recovered" and the turn resubmitted it until its retry budget ran out.
+#[tokio::test]
+async fn devbox_recovery_never_re_serves_the_credential_it_was_given_up_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = devbox_manager(dir.path(), "rejected-but-locally-valid");
+    assert!(
+        mgr.current().is_some(),
+        "precondition: the rejected bearer is still locally valid"
+    );
+
+    // Asserted as "not this credential" rather than as an error: on a real
+    // devbox the mint can genuinely succeed, and a *different* credential is
+    // exactly the outcome we want. Everywhere else there is no mint endpoint
+    // and this is an error.
+    let outcome = mgr
+        .try_devbox_recovery(Some("rejected-but-locally-valid"))
+        .await;
+    assert!(
+        !matches!(&outcome, Ok(auth) if auth.key == "rejected-but-locally-valid"),
+        "recovery must not report success with the rejected bearer, got {outcome:?}"
+    );
+}
+
+/// The double-check still does its job: a credential that is *not* the one
+/// the caller gave up on means a sibling task refreshed, so take it and skip
+/// the mint.
+#[tokio::test]
+async fn devbox_recovery_short_circuits_on_a_credential_someone_else_landed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = devbox_manager(dir.path(), "landed-by-a-sibling-task");
+
+    let auth = mgr
+        .try_devbox_recovery(Some("the-bearer-the-server-rejected"))
+        .await
+        .expect("a different live credential is a recovery");
+    assert_eq!(auth.key, "landed-by-a-sibling-task");
 }

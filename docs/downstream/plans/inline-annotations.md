@@ -578,6 +578,42 @@ Manual smoke test in a standard TUI:
     the previous `grok 0.2.106 (ba76b0a)` binary is retained at
     `/Users/wanglidong/.local/bin/grok.pre-annotations-0.2.106-ba76b0a`;
   - the primary repository remains clean on `main@ba76b0a`.
-- Current state: T8 and T9 are complete; the reviewed annotation build is
-  synchronized with `upstream/main@a5727c5`, installed locally, and published
-  through `downstream/main`. Pristine `main` remains unchanged at `ba76b0a`.
+- T10 upstream sync and delivery (2026-08-20):
+  - fast-forwarded the pristine `main` mirror and merged
+    `upstream/main@19d42e3` (`grok` 1.0.6) into `downstream/main`, resolving 18
+    conflicts while retaining the annotation routing, decoration, capability,
+    lifecycle, persistence, and minimal-mode boundaries;
+  - migrated annotation actor-policy setup into upstream's new
+    `mvp_agent/session_setup.rs`, fork-copy state into the split JSONL copy
+    module/tests, hidden-session coverage into the split persistence tests,
+    and preserved upstream turn-end queues, sticky headers, session metadata,
+    subagent tool filtering, and hyperlink cwd resolution;
+  - focused validation passes: 57 pager annotation tests and all 12 shell
+    annotation/fork/policy tests;
+  - `cargo fmt --all -- --check`, `cargo check -p xai-grok-pager-bin`,
+    `git diff --cached upstream/main --check`, and
+    `cargo build -p xai-grok-pager-bin --release` pass. The first-parent merge
+    diff inherits whitespace warnings already present in upstream prompt,
+    changelog, and rustdoc files;
+  - the pager lib run, excluding three upstream doctor tests that hang while
+    concurrently enumerating CoreAudio from the macOS test harness, is 8853
+    passed / 12 failed / 10 ignored. The failures remain in the unchanged
+    upstream baseline families: six skill-token color expectations, four
+    theme/cursor/background expectations, and two macOS `Opt+Enter` labels.
+    Pager integration compilation is independently blocked because the public
+    upstream tree omits the two `docs/internal/*.md` files included by
+    `registered_features_are_documented.rs`;
+  - the complete shell lib run with `RUST_MIN_STACK=16777216` is 6268 passed /
+    35 failed / 14 ignored. Twenty-three failures are the upstream
+    `jsonwebtoken` CryptoProvider feature conflict; the remainder are confined
+    to unchanged remote-settings/auth retry, prompt-queue, session-list,
+    symlink-count, and macOS `/private` path expectations. With
+    `--no-fail-fast`, every shell binary/integration target and doctest
+    completes without an additional failure;
+  - this merge commit updates `downstream/main`; the pristine `main` mirror and
+    integration branch are pushed without force, and a release binary rebuilt
+    from the committed tree is installed through the existing
+    `~/.local/bin/grok -> ~/.grok/bin/grok` path.
+- Current state: T8–T10 are complete; the reviewed annotation build is
+  synchronized with `upstream/main@19d42e3`, installed locally, and published
+  through `downstream/main`. Pristine `main` mirrors the same upstream commit.

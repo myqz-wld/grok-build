@@ -37,13 +37,6 @@ impl ParsedPrompt {
             self.is_cursor,
         )
     }
-    /// Assemble context and query into the final message string.
-    ///
-    /// Legacy entry point — delegates to [`assemble_parts_with_skills`] with
-    /// no skill information.
-    pub fn assemble_parts(context: &str, query: &str, is_cursor: bool) -> String {
-        Self::assemble_parts_with_skills(context, query, "", is_cursor)
-    }
     /// Assemble context, query, and skill information into the final message string.
     ///
     /// Layout:
@@ -101,7 +94,7 @@ pub async fn parse_prompt(
 ///
 /// This is the full-featured entry point. `parse_prompt` delegates here with
 /// an empty `skill_information` string for backward compatibility.
-pub async fn parse_prompt_with_skills(
+pub(crate) async fn parse_prompt_with_skills(
     prompt: &[acp::ContentBlock],
     working_directory: PathBuf,
     _session_info: &crate::session::info::Info,
@@ -220,9 +213,20 @@ fn collect_file_references(message: &str) -> Vec<String> {
         let Some(at_symbol_offset) = message[i..].find('@') else {
             break;
         };
-        let start = i + at_symbol_offset + 1;
-        if start >= message.len() || !message.is_char_boundary(start) {
+        let at = i + at_symbol_offset;
+        if !message.is_char_boundary(at) {
+            i = at.saturating_add(1);
+            continue;
+        }
+        let start = at + '@'.len_utf8();
+        if start > message.len() || !message.is_char_boundary(start) {
             break;
+        }
+        if let Some(ch) = message[..at].chars().next_back()
+            && (ch.is_alphanumeric() || ch == '_')
+        {
+            i = start;
+            continue;
         }
         let rest = &message[start..];
         let token = rest.split_whitespace().next().unwrap_or("");
@@ -230,6 +234,9 @@ fn collect_file_references(message: &str) -> Vec<String> {
             paths.push(token.to_string());
         }
         i = start + token.len().max(1);
+        while i < message.len() && !message.is_char_boundary(i) {
+            i += 1;
+        }
     }
     paths
 }
@@ -417,6 +424,16 @@ mod tests {
     fn test_collect_adjacent_references() {
         let tokens = collect_file_references("@a.rs @b.rs");
         assert_eq!(tokens, vec!["a.rs", "b.rs"]);
+    }
+    #[test]
+    fn test_collect_skips_email_addresses() {
+        let tokens = collect_file_references("email foo@bar.com and also @src/main.rs");
+        assert_eq!(tokens, vec!["src/main.rs"]);
+    }
+    #[test]
+    fn test_collect_email_and_at_ref_with_multibyte() {
+        let tokens = collect_file_references("連絡先 foo@bar.com と @src/main.rs を見て");
+        assert_eq!(tokens, vec!["src/main.rs"]);
     }
     fn make_link(meta: Option<serde_json::Value>) -> acp::ResourceLink {
         let mut link = acp::ResourceLink::new("test.rs", "file:///project/test.rs");
