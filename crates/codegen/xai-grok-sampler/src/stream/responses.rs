@@ -154,6 +154,7 @@ pub(crate) fn stream_responses_tracked<'a>(
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
+        let mut text_acc = String::new();
         let mut reasoning_acc = String::new();
         let mut last_content_chunk_at = Instant::now();
 
@@ -232,6 +233,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                         chunk_timestamps.push(Instant::now());
                         chunk_index += 1;
                         message_chunk_count += 1;
+                        text_acc.push_str(&delta);
                         yield SamplingEvent::ChannelToken {
                             request_id: request_id.clone(),
                             channel: SamplingChannel::Text,
@@ -542,11 +544,17 @@ pub(crate) fn stream_responses_tracked<'a>(
 
         let status = response.status.clone();
 
-        // Convert to ConversationItem(s); patch in accumulated reasoning
-        // text as a fallback when the final response lacks `content` /
-        // `summary` (the streaming deltas may have arrived out of band).
-        // Splice policy lives in `inject_streaming_reasoning_fallback`.
+        // Convert to ConversationItem(s); patch in accumulated text and
+        // reasoning as fallbacks when the final response omits content that
+        // arrived in streaming deltas. Responses Lite may send a minimal
+        // `response.completed` event without repeating its text output.
         let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        if !text_acc.is_empty()
+            && let Some(ConversationItem::Assistant(assistant)) = items.last_mut()
+            && assistant.content.is_empty()
+        {
+            assistant.content = Arc::from(text_acc);
+        }
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {
@@ -682,6 +690,26 @@ mod tests {
         })
     }
 
+    fn completed_event_with_text(text: &str) -> rs::ResponseStreamEvent {
+        let mut response = empty_completed_response();
+        response.output = vec![rs_types::OutputItem::Message(rs_types::OutputMessage {
+            content: vec![rs_types::OutputMessageContent::OutputText(
+                rs_types::OutputTextContent {
+                    text: text.into(),
+                    annotations: vec![],
+                    logprobs: None,
+                },
+            )],
+            id: "msg-1".into(),
+            role: rs_types::AssistantRole::Assistant,
+            status: rs_types::OutputStatus::Completed,
+        })];
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response,
+            sequence_number: 0,
+        })
+    }
+
     async fn collect(s: impl Stream<Item = SamplingEvent>) -> Vec<SamplingEvent> {
         let mut out = Vec::new();
         let mut s = pin!(s);
@@ -715,7 +743,12 @@ mod tests {
 
     #[tokio::test]
     async fn text_delta_then_completed_yields_completed_with_stop() {
-        let raw = stream::iter(vec![Ok(text_delta_event("hello")), Ok(completed_event())]).boxed();
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("hel")),
+            Ok(text_delta_event("lo")),
+            Ok(completed_event()),
+        ])
+        .boxed();
         let events = collect(stream_responses(
             raw,
             None,
@@ -736,11 +769,37 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(text_tokens, vec!["hello"]);
+        assert_eq!(text_tokens, vec!["hel", "lo"]);
 
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+                assert_eq!(response.assistant_text(), "hello");
+                assert_eq!(response.empty_reason(), None);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_text_is_not_overwritten_by_streaming_fallback() {
+        let raw = stream::iter(vec![
+            Ok(text_delta_event("streamed")),
+            Ok(completed_event_with_text("canonical")),
+        ])
+        .boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "canonical");
             }
             other => panic!("expected Completed, got {other:?}"),
         }

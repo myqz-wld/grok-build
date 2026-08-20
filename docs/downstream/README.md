@@ -14,6 +14,19 @@ policy is:
 | Feature | Status | Upstream base | User documentation | Design / execution plan |
 |---|---|---|---|---|
 | Persistent threaded inline annotations | Maintained on `downstream/main` | `19d42e3` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
+| Responses Lite text completion fallback | Maintained on `downstream/main` | `19d42e3` | N/A | N/A |
+
+### Responses Lite text completion fallback
+
+The Responses sampler accumulates `response.output_text.delta` content and
+uses it only when the terminal response omits Assistant text. This preserves
+the terminal response as authoritative when it contains text while preventing
+minimal Responses Lite completion events from being misclassified as empty
+model responses and retried.
+
+Primary path:
+
+- `crates/codegen/xai-grok-sampler/src/stream/responses.rs`
 
 ### Inline annotations
 
