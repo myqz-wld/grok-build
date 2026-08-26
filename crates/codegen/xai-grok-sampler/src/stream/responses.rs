@@ -15,7 +15,7 @@ use futures_util::stream::{BoxStream, Stream};
 
 use xai_grok_sampling_types::{
     ConversationItem, ConversationResponse, ResponseModelMetadata, SamplingError, StopReason,
-    TokenUsage, rs,
+    TokenUsage, ToolCall, rs,
 };
 
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
@@ -163,6 +163,9 @@ pub(crate) fn stream_responses_tracked<'a>(
         // later `ResponseFunctionCallArgumentsDelta` events
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
+        // Responses Lite may omit function calls from the terminal response.
+        // Retain the streamed canonical pieces for a terminal-only fallback.
+        let mut tool_call_acc: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
         let mut next_tool_index: u32 = 0;
 
         let mut stream = raw_stream;
@@ -286,9 +289,14 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // and remember the output_index → tool_index mapping.
                 ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
                     if let rs::OutputItem::FunctionCall(fc) = added_event.item {
+                        let output_index = added_event.output_index;
                         let tool_index = next_tool_index;
                         next_tool_index += 1;
-                        output_to_tool_index.insert(added_event.output_index, tool_index);
+                        output_to_tool_index.insert(output_index, tool_index);
+                        tool_call_acc.insert(
+                            output_index,
+                            (fc.call_id.clone(), fc.name.clone(), fc.arguments.clone()),
+                        );
 
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
@@ -308,6 +316,9 @@ pub(crate) fn stream_responses_tracked<'a>(
                         && let Some(&tool_index) =
                             output_to_tool_index.get(&args_event.output_index)
                     {
+                        if let Some(call) = tool_call_acc.get_mut(&args_event.output_index) {
+                            call.2.push_str(&delta);
+                        }
                         yield SamplingEvent::ToolCallDelta {
                             request_id: request_id.clone(),
                             tool_index,
@@ -315,6 +326,17 @@ pub(crate) fn stream_responses_tracked<'a>(
                             name: None,
                             arguments_delta: Some(delta),
                         };
+                    }
+                }
+
+                // The done event carries canonical full arguments. It may be
+                // the only argument-bearing event before a minimal terminal.
+                ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done_event) => {
+                    if let Some(call) = tool_call_acc.get_mut(&done_event.output_index) {
+                        if let Some(name) = done_event.name.filter(|name| !name.is_empty()) {
+                            call.1 = name;
+                        }
+                        call.2 = done_event.arguments;
                     }
                 }
 
@@ -419,6 +441,29 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // For CustomToolCall this includes x_search results.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
                     match &done_event.item {
+                        rs::OutputItem::FunctionCall(fc) => {
+                            let output_index = done_event.output_index;
+                            let existing_index = output_to_tool_index.get(&output_index).copied();
+                            let tool_index = existing_index.unwrap_or_else(|| {
+                                let index = next_tool_index;
+                                next_tool_index += 1;
+                                output_to_tool_index.insert(output_index, index);
+                                index
+                            });
+                            tool_call_acc.insert(
+                                output_index,
+                                (fc.call_id.clone(), fc.name.clone(), fc.arguments.clone()),
+                            );
+                            if existing_index.is_none() {
+                                yield SamplingEvent::ToolCallDelta {
+                                    request_id: request_id.clone(),
+                                    tool_index,
+                                    id: Some(fc.call_id.clone()),
+                                    name: Some(fc.name.clone()),
+                                    arguments_delta: Some(fc.arguments.clone()),
+                                };
+                            }
+                        }
                         rs::OutputItem::WebSearchCall(ws) => {
                             let result = serde_json::to_value(ws).ok();
                             yield SamplingEvent::BackendToolCallCompleted {
@@ -548,12 +593,26 @@ pub(crate) fn stream_responses_tracked<'a>(
         // reasoning as fallbacks when the final response omits content that
         // arrived in streaming deltas. Responses Lite may send a minimal
         // `response.completed` event without repeating its text output.
+        let streamed_tool_calls = tool_call_acc
+            .into_values()
+            .map(|(id, name, arguments)| ToolCall {
+                id: Arc::<str>::from(id),
+                name,
+                arguments: Arc::<str>::from(arguments),
+            })
+            .collect::<Vec<_>>();
         let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
         if !text_acc.is_empty()
             && let Some(ConversationItem::Assistant(assistant)) = items.last_mut()
             && assistant.content.is_empty()
         {
             assistant.content = Arc::from(text_acc);
+        }
+        if !streamed_tool_calls.is_empty()
+            && let Some(ConversationItem::Assistant(assistant)) = items.last_mut()
+            && assistant.tool_calls.is_empty()
+        {
+            assistant.tool_calls = streamed_tool_calls;
         }
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
@@ -1113,6 +1172,46 @@ mod tests {
         )
     }
 
+    fn function_call_done_event(
+        output_index: u32,
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> rs::ResponseStreamEvent {
+        rs::ResponseStreamEvent::ResponseOutputItemDone(rs_types::ResponseOutputItemDoneEvent {
+            sequence_number: 0,
+            output_index,
+            item: rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                arguments: arguments.into(),
+                call_id: call_id.into(),
+                name: name.into(),
+                id: None,
+                status: None,
+            }),
+        })
+    }
+
+    fn completed_event_with_function_call(
+        call_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> rs::ResponseStreamEvent {
+        let mut response = empty_completed_response();
+        response.output = vec![rs_types::OutputItem::FunctionCall(
+            rs_types::FunctionToolCall {
+                arguments: arguments.into(),
+                call_id: call_id.into(),
+                name: name.into(),
+                id: None,
+                status: None,
+            },
+        )];
+        rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+            response,
+            sequence_number: 0,
+        })
+    }
+
     type Delta = (u32, Option<String>, Option<String>, Option<String>);
 
     /// Extract all ToolCallDelta events as (tool_index, id, name, arguments_delta).
@@ -1165,6 +1264,88 @@ mod tests {
         assert_eq!(deltas[1].2, None);
         assert_eq!(deltas[1].3.as_deref(), Some("{\"x\":"));
         assert_eq!(deltas[2].3.as_deref(), Some("1}"));
+
+        match evs.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id.as_ref(), "call_xyz");
+                assert_eq!(calls[0].name, "do_thing");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"x\":1}");
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+                assert_eq!(response.empty_reason(), None);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn function_call_done_survives_minimal_terminal_response() {
+        let raw = stream::iter(vec![
+            Ok(function_call_done_event(
+                0,
+                "call_done",
+                "read_file",
+                "{\"path\":\"README.md\"}",
+            )),
+            Ok(completed_event()),
+        ])
+        .boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        assert_eq!(tool_call_deltas(&evs).len(), 1);
+        match evs.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id.as_ref(), "call_done");
+                assert_eq!(calls[0].name, "read_file");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"path\":\"README.md\"}");
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+                assert_eq!(response.empty_reason(), None);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_function_call_is_not_overwritten_by_streaming_fallback() {
+        let raw = stream::iter(vec![
+            Ok(function_call_added_event(0, "call_stream", "stream_tool")),
+            Ok(function_call_args_delta_event(0, "{\"stream\":true}")),
+            Ok(completed_event_with_function_call(
+                "call_terminal",
+                "terminal_tool",
+                "{\"terminal\":true}",
+            )),
+        ])
+        .boxed();
+        let evs = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match evs.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id.as_ref(), "call_terminal");
+                assert_eq!(calls[0].name, "terminal_tool");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"terminal\":true}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
