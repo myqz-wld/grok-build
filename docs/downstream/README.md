@@ -85,5 +85,7 @@ edits mechanical.
    `cargo check -p xai-grok-pager-bin`, `cargo test -p xai-grok-pager`, and
    `cargo test -p xai-grok-shell`.
 5. Smoke-test annotation creation/follow-up/reload in the standard TUI and
-   confirm `--minimal` behavior remains unchanged.
+   confirm `--minimal` behavior remains unchanged. The executable regression is
+   `cargo test -p xai-grok-pager-pty-harness --test downstream_annotations -- --ignored`
+   with `PAGER_BINARY` set to the release artifact.
 6. Update this ledger's base/status and the feature plan's execution record.

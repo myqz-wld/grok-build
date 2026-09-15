@@ -34,11 +34,12 @@ through the existing local `grok` installation with a recoverable previous versi
 - [x] Create isolated worktree and integration branch.
 - [x] Resolve Markdown, pager, shell, workspace, sampler, and lockfile conflicts.
 - [x] Format, check pager binary, and run focused downstream regression tests.
-- [ ] Run pager/shell suites and standard/minimal startup checks.
+- [x] Run pager/shell suites and standard/minimal startup checks.
 - [x] Update feature ledger and execution record; commit integration.
-- [ ] Build release from the committed tree; verify reported version and commit.
+- [x] Build release from the committed tree; verify reported version and commit.
 - [ ] Fast-forward and push downstream/main and pristine main without force.
-- [ ] Back up/install locally, verify deployment, and restore the primary workspace.
+- [x] Back up/install locally and verify deployment.
+- [ ] Restore the primary workspace and remove the leased worktree.
 
 ## Validation and risks
 
@@ -53,8 +54,8 @@ Confirm the current status before classifying any failure as baseline.
 
 ## Next action
 
-Build the release artifact from the integration commit, then run real-terminal
-annotation, standard/minimal startup, and shell integration checks before delivery.
+Fast-forward and push the original integration branch, publish the pristine
+mirror, then restore the primary workspace and remove the leased worktree.
 
 Added an ignored PTY regression in `xai-grok-pager-pty-harness` for annotation
 creation, restart/reload, follow-up in the same hidden child, and parent transcript
@@ -102,3 +103,45 @@ None at start; deployment follows the repository's previous local delivery.
 - Pager documentation integration target cannot compile because upstream omits
   `docs/internal/25-enterprise.md` and `docs/internal/22-environment-variables.md`.
   The missing files are also absent from `upstream/main` (verified with Git).
+
+### Integration artifact
+
+- Functional merge commit: `be4bb23da4c2cf15a42c220a9d5a8243175f87a8`.
+- Parents: downstream `e0a6bb5a` and upstream `48271133`.
+- Release build uses `GROK_VERSION=1.0.32`, the pinned Rust toolchain, and
+  `cargo build --locked -p xai-grok-pager-bin --release`.
+- Pre-deployment installed binary: Grok 1.0.6 (`e0a6bb5`), SHA-256
+  `084f4b8790cf17fc24b3b8d2a531c960309322cfc384879034e72cc546fd0bc7`.
+
+- PTY smoke, minimal-mode, and downstream annotation test binaries compiled
+  successfully. Waiting for the release binary before executing them.
+
+- Release build passed in 14m 15s. Artifact reports `grok 1.0.32 (be4bb23da4c2)`;
+  SHA-256: `2c9d9e1ad47619109551bb7b2a590e10e7bb213fb02a932988642473633ecc0f`.
+- Local pristine `main` was fast-forwarded to the frozen upstream commit.
+
+- Release PTY checks all passed: standard welcome/quit, minimal Ctrl+C
+  confirmation/quit, and annotation create → restart/reload → follow-up.
+  The annotation test confirms one persisted child and two completed exchanges,
+  with neither answer in the parent transcript.
+- Default shell integration compilation hit an upstream harness configuration
+  issue: `reset_startup_settings_for_tests` is gated by `test-support`, but a
+  default integration target uses it. Running the integration/binary tests with
+  the repository's `test-support` feature and the actual release artifact.
+
+### Completed runtime validation and local deployment
+
+- Shell integration/binary tests with `--features test-support`: **35 targets,
+  131 passed, 0 failed, 3 ignored**. Tests that spawn Grok use this release via
+  `GROK_BINARY`, `GROK_BINARY_LEADER`, and `GROK_BINARY_CLIENT`.
+- Shell doctest command succeeds; both doctest examples are marked ignored
+  upstream (0 run, 2 ignored).
+- Installed: `grok 1.0.32 (be4bb23da4c2)` through the existing
+  `~/.local/bin/grok -> ~/.grok/bin/grok` link. Both Grok and legacy agent
+  aliases now select `grok-1.0.32-macos-aarch64-downstream-be4bb23da4c2`.
+- Verified the installed version and SHA-256 against the tested artifact.
+- Preserved the previous download and an independent executable backup at
+  `~/.grok/backups/grok-1.0.6-e0a6bb5-20260915`.
+- Rollback can point both `~/.grok/bin/grok` and `~/.grok/bin/agent` at that
+  backup; retain the outer `~/.local/bin/grok` link.
+- No Agent Deck process or app bundle was restarted or replaced.

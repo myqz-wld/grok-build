@@ -618,6 +618,6 @@ Manual smoke test in a standard TUI:
   (Grok 1.0.32) while retaining annotations and Responses Lite fallbacks.
   The detailed conflict resolutions, validation, deployment, and rollback
   status are in [the sync record](upstream-sync-20260915.md).
-- Current state: T8–T10 are complete. T11 integration has passed binary checking
-  and focused annotation tests; release validation and local deployment are in
-  progress as recorded in the sync record.
+- Current state: T8–T11 implementation and runtime validation are complete.
+  Grok 1.0.32 (`be4bb23da4c2`) is installed locally with a verified backup.
+  Branch publication and workspace cleanup are tracked in the sync record.
