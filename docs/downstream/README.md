@@ -13,8 +13,8 @@ policy is:
 
 | Feature | Status | Upstream base | User documentation | Design / execution plan |
 |---|---|---|---|---|
-| Persistent threaded inline annotations | Maintained on `downstream/main` | `19d42e3` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
-| Responses Lite streamed completion fallback | Maintained on `downstream/main` | `19d42e3` | N/A | N/A |
+| Persistent threaded inline annotations | Maintained on `downstream/main` | `48271133` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
+| Responses Lite streamed completion fallback | Maintained on `downstream/main` | `48271133` | N/A | N/A |
 
 ### Responses Lite streamed completion fallback
 
@@ -50,6 +50,12 @@ Persisted data is append-only `annotation_threads.jsonl` beneath the parent
 session directory. Annotation children are ordinary persisted session
 directories marked `session_kind=annotation` and `hidden=true`; deleting a card
 does not recursively delete its child directory.
+
+## Latest synchronization
+
+The 2026-09-15 integration targets upstream Grok 1.0.32 at `48271133`.
+See the [sync and deployment record](plans/upstream-sync-20260915.md) for
+validation results, known upstream test limitations, and local deployment status.
 
 ## Upstream Synchronization Hotspots
 

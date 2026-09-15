@@ -1,6 +1,8 @@
-//! Tracks open TUI sessions in `~/.grok/active_sessions.json` for crash
-//! recovery. Clean exit removes the entry; crash leaves it behind. On next
-//! launch, [`collect_crashed`] finds orphaned entries (dead PIDs).
+//! Tracks open TUI sessions in `~/.grok/active_sessions.json` for crash recovery.
+//! A clean exit removes the entry; a crash leaves it behind.
+//! On next launch, [`collect_crashed`] finds orphaned entries (dead PIDs).
+
+#![deny(clippy::indexing_slicing)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -30,8 +32,8 @@ pub fn register(session: ActiveSession) -> io::Result<()> {
     register_in(&xai_grok_config::grok_home(), session)
 }
 
-/// Non-blocking unregister for signal handlers. Returns `Ok(false)` on
-/// lock contention; the orphan is cleaned up by `collect_crashed` next launch.
+/// Non-blocking unregister for signal handlers.
+/// Returns `Ok(false)` on lock contention; the orphan is cleaned up by `collect_crashed` next launch.
 pub fn try_unregister(session_id: &acp::SessionId) -> io::Result<bool> {
     try_unregister_in(&xai_grok_config::grok_home(), session_id)
 }
@@ -234,8 +236,17 @@ mod tests {
 
         let crashed = collect_crashed_in(dir.path()).unwrap();
         assert_eq!(crashed.len(), 1);
-        assert_eq!(&*crashed[0].session_id.0, "dead");
-        assert_eq!(&*list_in(dir.path()).unwrap()[0].session_id.0, "alive");
+        assert_eq!(
+            crashed.first().map(|s| s.session_id.0.as_ref()),
+            Some("dead")
+        );
+        assert_eq!(
+            list_in(dir.path())
+                .unwrap()
+                .first()
+                .map(|s| s.session_id.0.as_ref()),
+            Some("alive")
+        );
     }
 
     #[test]

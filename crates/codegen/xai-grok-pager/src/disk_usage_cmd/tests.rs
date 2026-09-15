@@ -155,13 +155,14 @@ fn record_registered_via_symlinked_home_joins_as_one_row() {
     .unwrap();
 
     let report = collect_report(&real_home).unwrap();
-    assert_eq!(
-        report.worktrees.len(),
-        1,
-        "a record stored under a symlinked home must not also appear as untracked"
-    );
-    assert!(report.worktrees[0].is_tracked());
-    assert_eq!(report.worktrees[0].label(), "via-link");
+    let [wt] = report.worktrees.as_slice() else {
+        panic!(
+            "a record stored under a symlinked home must not also appear as untracked: {:?}",
+            report.worktrees
+        );
+    };
+    assert!(wt.is_tracked());
+    assert_eq!(wt.label(), "via-link");
 }
 
 #[cfg(unix)]
@@ -175,13 +176,14 @@ fn duplicate_discovered_dirs_size_once() {
     std::os::unix::fs::symlink(&wt, home.join("worktrees/xai/wt-alias")).unwrap();
 
     let report = collect_report(&home).unwrap();
-    assert_eq!(
-        report.worktrees.len(),
-        1,
-        "two discovered entries canonicalizing to one dir must yield one row"
-    );
-    assert!(!report.worktrees[0].is_tracked());
-    assert_eq!(report.worktrees[0].bytes, measured(&wt));
+    let [row] = report.worktrees.as_slice() else {
+        panic!(
+            "two discovered entries canonicalizing to one dir must yield one row: {:?}",
+            report.worktrees
+        );
+    };
+    assert!(!row.is_tracked());
+    assert_eq!(row.bytes, measured(&wt));
 }
 
 #[cfg(unix)]
@@ -276,8 +278,10 @@ fn registry_absent_reports_untracked_rows() {
     let report = collect_report(&home).unwrap();
     assert_eq!(dir_names(&home), before, "collecting must not create files");
     assert_eq!(report.registry, RegistryState::Absent);
-    assert_eq!(report.worktrees.len(), 1);
-    assert!(!report.worktrees[0].is_tracked());
+    let [wt] = report.worktrees.as_slice() else {
+        panic!("expected one untracked worktree: {:?}", report.worktrees);
+    };
+    assert!(!wt.is_tracked());
 }
 
 #[test]
@@ -296,16 +300,17 @@ fn corrupt_registry_degrades_to_untracked_rows() {
     let report = collect_report(&home).unwrap();
     assert_eq!(report.registry, RegistryState::Corrupt);
     assert!(!report.top_level_dirs.is_empty());
-    assert_eq!(report.worktrees.len(), 1);
-    assert!(!report.worktrees[0].is_tracked());
+    let [wt] = report.worktrees.as_slice() else {
+        panic!("expected one untracked worktree: {:?}", report.worktrees);
+    };
+    assert!(!wt.is_tracked());
     assert_eq!(
-        serde_json::to_value(&report).unwrap()["registry"],
-        "corrupt"
+        serde_json::to_value(&report).unwrap().get("registry"),
+        Some(&serde_json::json!("corrupt"))
     );
 }
 
-// The fallback must not re-measure an excluded row against its own volume:
-// that printed bytes the total did not hold.
+// The fallback must not re-measure an excluded row against its own volume: that printed bytes the total did not hold
 #[cfg(unix)]
 #[test]
 fn a_row_off_the_anchor_reports_no_size() {
@@ -373,8 +378,7 @@ fn every_open_outcome_maps_to_its_state() {
     }
 }
 
-// Deleting a registry that is merely unopenable loses every label,
-// creation time, and session id in it.
+// Deleting a registry that is merely unopenable loses every label, creation time, and session id in it
 #[test]
 fn unopenable_registry_is_not_reported_as_corrupt() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -395,8 +399,7 @@ fn unopenable_registry_is_not_reported_as_corrupt() {
     );
 }
 
-// A column showing only creation prints 40d beside a `--max-age 7d` hint
-// for a worktree gc will not touch.
+// A column showing only creation prints 40d beside a `--max-age 7d` hint for a worktree gc will not touch
 #[test]
 fn age_column_reads_what_gc_reads() {
     const DAY: i64 = 86_400;
@@ -436,8 +439,7 @@ fn walk_issues_convert_to_report_counters() {
     );
 }
 
-// Flipping Busy to Corrupt puts "damaged, remove it" in front of a user
-// whose registry is only busy.
+// Flipping Busy to Corrupt puts "damaged, remove it" in front of a user whose registry is only busy
 #[test]
 fn sqlite_failure_kinds_map_to_states() {
     let cases = [
@@ -450,8 +452,8 @@ fn sqlite_failure_kinds_map_to_states() {
     }
 }
 
-// A read-only WAL open leaves sidecars, so sizing runs first. Only their
-// absence from the total proves the ordering.
+// A read-only WAL open leaves sidecars, so sizing runs first
+// Only their absence from the total proves the ordering
 #[test]
 fn the_registry_open_lands_after_sizing() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -636,7 +638,10 @@ fn json_shape_is_frozen() {
     );
 
     // Serialize is hand-written, and `to_value` would not see a reshuffle.
-    let pretty = serde_json::to_string_pretty(&report.worktrees[0]).unwrap();
+    let Some(first) = report.worktrees.first() else {
+        panic!("frozen fixture includes a tracked worktree");
+    };
+    let pretty = serde_json::to_string_pretty(first).unwrap();
     let keys: Vec<&str> = pretty
         .lines()
         .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
@@ -670,11 +675,11 @@ fn missing_home_json_is_valid_and_empty() {
     )
     .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(json["schema_version"], 1);
-    assert_eq!(json["registry"], "absent");
-    assert_eq!(json["registry_path"], "");
-    assert_eq!(json["total_bytes"], 0);
-    assert_eq!(json["worktrees"], serde_json::json!([]));
+    assert_eq!(json.get("schema_version"), Some(&serde_json::json!(1)));
+    assert_eq!(json.get("registry"), Some(&serde_json::json!("absent")));
+    assert_eq!(json.get("registry_path"), Some(&serde_json::json!("")));
+    assert_eq!(json.get("total_bytes"), Some(&serde_json::json!(0)));
+    assert_eq!(json.get("worktrees"), Some(&serde_json::json!([])));
 }
 
 #[test]
@@ -719,7 +724,10 @@ fn print_report_truncates_long_labels_and_keeps_columns_aligned() {
     };
     let text = render_report(&report, 1_000_000_000);
 
-    assert!(text.contains(&format!("{}…", &long_label[..23])));
+    let Some(truncated) = long_label.get(..23) else {
+        panic!("label is 30 ASCII 'a's");
+    };
+    assert!(text.contains(&format!("{truncated}…")));
     assert!(!text.contains(&long_label));
     assert!(text.contains("session (dead)"));
     assert!(text.contains("untracked (session)"));
@@ -873,8 +881,7 @@ fn print_report_renders_registry_notices() {
     }
 }
 
-// Bare `gc` reclaims nothing: without `--max-age` the age pass is off, and
-// the pass only walks registry records.
+// Bare `gc` reclaims nothing: without `--max-age` the age pass is off, and the pass only walks registry records
 #[test]
 fn reclaim_hint_names_a_sequence_that_frees_space() {
     const AGE: &str = "run `grok worktree gc --max-age 7d --dry-run`";
@@ -977,9 +984,11 @@ fn symlinked_worktrees_dir_is_surfaced_not_silently_dropped() {
         "a symlinked worktrees dir is not a dir entry, so it never reaches the breakdown: {:?}",
         report.top_level_dirs
     );
-    assert_eq!(report.worktrees.len(), 1);
+    let [wt] = report.worktrees.as_slice() else {
+        panic!("expected the escaped worktree row: {:?}", report.worktrees);
+    };
     assert!(
-        report.worktrees[0].bytes.unwrap() > report.total_bytes,
+        wt.bytes.is_some_and(|bytes| bytes > report.total_bytes),
         "the row must outsize a total that never walked the target"
     );
     assert!(
@@ -991,7 +1000,7 @@ fn symlinked_worktrees_dir_is_surfaced_not_silently_dropped() {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(GROK_HOME)]
-// serial keys are independent locks, so a test setting both must hold both.
+// Serial keys are independent locks, so a test setting both must hold both
 #[serial_test::serial(HOME)]
 fn symlinked_default_home_keeps_home_label() {
     let tmp = tempfile::TempDir::new().unwrap();

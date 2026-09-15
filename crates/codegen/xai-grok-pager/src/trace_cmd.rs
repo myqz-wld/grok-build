@@ -51,7 +51,7 @@ pub async fn run(args: TraceArgs, agent_config: &AgentConfig) -> Result<()> {
         if !args.json {
             eprintln!(
                 "Trace uploads disabled. Set [telemetry] trace_upload = true in {}",
-                crate::util::display_user_grok_path("config.toml")
+                crate::util::display_user_grok_path(xai_grok_config::USER_CONFIG_FILENAME)
             );
             eprintln!("Falling back to local export.");
         }
@@ -72,10 +72,6 @@ pub async fn run(args: TraceArgs, agent_config: &AgentConfig) -> Result<()> {
     )
     .await
 }
-
-// ---------------------------------------------------------------------------
-// Archive construction
-// ---------------------------------------------------------------------------
 
 pub fn build_session_tar(
     session_dir: &Path,
@@ -163,7 +159,7 @@ struct ExportMetadata {
     memtrace_files: usize,
 }
 
-/// No URLs, paths, or bucket names -- only booleans and config source indicators.
+/// No URLs, paths, or bucket names, only booleans and config source indicators.
 #[derive(serde::Serialize)]
 struct TraceConfigSnapshot {
     trace_upload_enabled: bool,
@@ -263,10 +259,6 @@ fn add_directory_to_tar<W: std::io::Write>(
     Ok(count)
 }
 
-// ---------------------------------------------------------------------------
-// Upload method diagnostics
-// ---------------------------------------------------------------------------
-
 /// Show first and last `n` chars with `***` in between. Char-safe (no byte-boundary panics).
 /// Returns the full string if it's short enough that redacting would be pointless.
 fn redact_middle(s: &str, n: usize) -> String {
@@ -274,8 +266,15 @@ fn redact_middle(s: &str, n: usize) -> String {
     if chars.len() <= n * 2 + 3 {
         return s.to_owned();
     }
-    let prefix: String = chars[..n].iter().collect();
-    let suffix: String = chars[chars.len() - n..].iter().collect();
+    let Some(prefix_chars) = chars.get(..n) else {
+        return s.to_owned();
+    };
+    let suffix_start = chars.len().checked_sub(n);
+    let Some(suffix_chars) = suffix_start.and_then(|i| chars.get(i..)) else {
+        return s.to_owned();
+    };
+    let prefix: String = prefix_chars.iter().collect();
+    let suffix: String = suffix_chars.iter().collect();
     format!("{prefix}***{suffix}")
 }
 
@@ -337,10 +336,6 @@ impl std::fmt::Display for UploadMethodDisplay<'_> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Local export
-// ---------------------------------------------------------------------------
 
 pub(crate) fn find_session_dir(session_id: &str) -> Result<PathBuf> {
     xai_grok_shell::session::persistence::find_session_dir_by_id(session_id).with_context(|| {
@@ -417,10 +412,6 @@ async fn run_export(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Upload with fallback
-// ---------------------------------------------------------------------------
-
 /// Prints upload URL to stdout on success; saves local bundle and returns Err on failure.
 async fn run_upload(
     session_id: &str,
@@ -455,8 +446,7 @@ async fn run_upload(
     let archive = build_session_tar(&session_dir, session_id, agent_config)?;
     let archive_size = archive.len();
 
-    // Proxy-mode uploads don't need a bucket (the proxy owns the
-    // destination); direct GCS uploads do.
+    // Proxy-mode uploads don't need a bucket (the proxy owns the destination); direct GCS uploads do
     let bucket_url = agent_config
         .endpoints
         .resolve_trace_bucket_url()
@@ -550,7 +540,7 @@ pub struct UploadAttempt<'a> {
 }
 
 impl UploadAttempt<'_> {
-    /// Saves local bundle + debug log, prints diagnostics.
+    /// Saves local bundle and debug log, prints diagnostics.
     pub fn handle_failure(&self, error: &anyhow::Error) -> anyhow::Error {
         let export_dir = trace_exports_dir();
         std::fs::create_dir_all(&export_dir).ok();
@@ -617,10 +607,6 @@ impl UploadAttempt<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Upload with retries
-// ---------------------------------------------------------------------------
-
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 async fn upload_with_retries(
@@ -651,14 +637,12 @@ async fn upload_with_retries(
     .await
 }
 
-// ---------------------------------------------------------------------------
-// Upload method resolution
-// ---------------------------------------------------------------------------
-
 pub async fn resolve_upload_method(agent_config: &AgentConfig) -> Option<UploadMethod> {
     // On login failure, fall back to ambient creds rather than erroring.
-    let auth_token = xai_grok_shell::auth::ensure_authenticated_or_noninteractive(
+    let auth_token = xai_grok_login::ensure_authenticated_or_noninteractive(
         &agent_config.grok_com_config,
+        agent_config.login_device_flow,
+        agent_config.endpoints.proxy_url(),
         agent_config.endpoints.has_noninteractive_upload_auth(),
         Some("Authentication required for trace upload."),
     )

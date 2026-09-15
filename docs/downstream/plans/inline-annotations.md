@@ -614,6 +614,10 @@ Manual smoke test in a standard TUI:
     integration branch are pushed without force, and a release binary rebuilt
     from the committed tree is installed through the existing
     `~/.local/bin/grok -> ~/.grok/bin/grok` path.
-- Current state: T8–T10 are complete; the reviewed annotation build is
-  synchronized with `upstream/main@19d42e3`, installed locally, and published
-  through `downstream/main`. Pristine `main` mirrors the same upstream commit.
+- T11 upstream sync (2026-09-15): integrating `upstream/main@48271133`
+  (Grok 1.0.32) while retaining annotations and Responses Lite fallbacks.
+  The detailed conflict resolutions, validation, deployment, and rollback
+  status are in [the sync record](upstream-sync-20260915.md).
+- Current state: T8–T10 are complete. T11 integration has passed binary checking
+  and focused annotation tests; release validation and local deployment are in
+  progress as recorded in the sync record.

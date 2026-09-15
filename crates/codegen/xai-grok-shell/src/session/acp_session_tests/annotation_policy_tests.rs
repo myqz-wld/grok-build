@@ -335,7 +335,7 @@ async fn annotation_actor_is_told_its_exact_restricted_tool_surface() {
             let conversation = actor.chat_state_handle.get_conversation().await;
             let reminder = match conversation.as_slice() {
                 [ConversationItem::User(item)]
-                    if item.synthetic_reason == Some(SyntheticReason::SystemReminder) =>
+                    if item.synthetic_reason == SyntheticReason::SystemReminder =>
                 {
                     conversation[0].text_content()
                 }
@@ -426,32 +426,24 @@ async fn annotation_actor_suppresses_start_and_both_end_hook_paths() {
                 );
             }
 
-            actor
-                .dispatch_hook(
-                    HookEventName::SessionStart,
-                    HookPayload::SessionStart {
-                        source: "annotation-load".to_string(),
-                        model_id: None,
-                        agent_type: None,
-                    },
-                    None,
-                    None,
+            actor.fire_hook(
+                HookEventName::SessionStart,
+                None,
+                HookPayload::SessionStart {
+                    source: "annotation-load".to_string(),
+                    model_id: None,
+                    agent_type: None,
+                },
+            );
+            for reason in ["channel_closed", "shutdown"] {
+                let timer = xai_grok_telemetry::session_end::SessionEndTimer::new_shared();
+                super::run_loop::fire_session_end_hooks(
+                    &actor,
+                    reason,
+                    &timer,
+                    &mut super::run_loop::DeferredStart::new(),
                 )
                 .await;
-            for reason in ["channel_closed", "shutdown"] {
-                actor
-                    .dispatch_hook(
-                        HookEventName::SessionEnd,
-                        HookPayload::SessionEnd {
-                            reason: reason.to_string(),
-                            subagent_type: None,
-                            turn_count: None,
-                            tool_call_count: None,
-                        },
-                        None,
-                        None,
-                    )
-                    .await;
                 actor.dispatch_session_end_stop(reason).await;
             }
 

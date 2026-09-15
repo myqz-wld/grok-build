@@ -3,12 +3,12 @@ use crate::capability::CapabilityMode;
 use crate::handle::tests::{
     background_capable_cfg, make_confining_handle, make_handle, start_background_sleep,
 };
+use std::sync::Arc;
 use xai_grok_tools::implementations::grok_build::scheduler::types::{
     ScheduledTask, SchedulerState,
 };
 use xai_grok_tools::types::resources::State;
 use xai_tool_protocol::turn_hook;
-/// Helper: consume the first item from a ToolStream.
 async fn next_item(
     stream: &mut ToolStream<TypedToolOutput>,
 ) -> Option<xai_tool_runtime::ToolStreamItem<TypedToolOutput>> {
@@ -110,8 +110,52 @@ async fn dispatch_unknown_method_returns_unknown_method_error() {
         other => panic!("expected UnknownMethod, got {other:?}"),
     }
 }
-/// A hub evict runs the two-phase drain then settles into terminal
-/// ShuttingDown (not a lingering Draining) for an evicted workspace.
+#[tokio::test]
+async fn handle_evict_unbind_does_not_unmount() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let handle = make_handle();
+    handle
+        .create_session_with_cwd("evict-conv", None)
+        .expect("create");
+    handle
+        .session("evict-conv")
+        .expect("session")
+        .set_path_virtualization(
+            crate::path_virtualization::PathVirtualization::try_from_session_root(
+                "/workspace/evict-conv",
+            )
+            .expect("valid"),
+        );
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let unbinds = Arc::new(AtomicUsize::new(0));
+    let mounts_c = mounts.clone();
+    let unbinds_c = unbinds.clone();
+    handle.set_bind_mount_hook(
+        crate::path_virtualization::BindMountHook::probe_then_mount(
+            |_| false,
+            move |_| {
+                mounts_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .with_on_unbind(move |_, _| {
+            unbinds_c.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    WorkspaceRpcHandler::new(handle)
+        .handle_evict(ToolServerEvictParams {
+            session_id: SessionId::new("evict-conv").unwrap(),
+            reason: "test".into(),
+            grace_period_ms: 50,
+        })
+        .await;
+    assert_eq!(
+        mounts.load(Ordering::SeqCst),
+        0,
+        "evict/prune must not mount or unmount"
+    );
+    assert_eq!(unbinds.load(Ordering::SeqCst), 1);
+}
 #[tokio::test]
 async fn handle_evict_triggers_two_phase_drain() {
     use xai_tool_protocol::ToolServerLifecycleStatus;
@@ -137,9 +181,6 @@ async fn handle_evict_triggers_two_phase_drain() {
         "evict drain must stamp drain_started_ms"
     );
 }
-/// A hub evict shuts the evicted session's terminal backend down
-/// explicitly: the actor stops even while other `Arc`s to the backend are
-/// still alive (mirrors `drop_session_shuts_down_terminal_backend_explicitly`).
 #[tokio::test]
 async fn handle_evict_shuts_down_terminal_backend_explicitly() {
     let handle = make_handle();
@@ -158,11 +199,6 @@ async fn handle_evict_shuts_down_terminal_backend_explicitly() {
     crate::handle::tests::assert_backend_stops(&retained_backend).await;
     drop(retained_toolset);
 }
-/// Isolation matrix #1/#3 at the RPC surface: `workspace.list_background_tasks`
-/// (the post-compaction reminder source of truth) stays truthful across
-/// both rebind shapes. The task stays listed through a `Reused` rebind
-/// AND a `Reresolved` toolset swap — reading it through each rebind's
-/// CURRENT toolset — and leaves the list only when explicitly killed.
 #[tokio::test]
 async fn list_background_tasks_rpc_stays_truthful_across_rebinds() {
     use crate::capability::CapabilityMode;
@@ -204,9 +240,19 @@ async fn list_background_tasks_rpc_stays_truthful_across_rebinds() {
     }
     let tasks = list_tasks(&handler).await;
     assert_eq!(tasks.len(), 1, "the running task must be listed");
-    assert_eq!(tasks[0].task_id, bg.task_id);
     assert_eq!(
-        tasks[0].tool_name.as_deref(),
+        tasks
+            .first()
+            .unwrap_or_else(|| panic!("expected task"))
+            .task_id,
+        bg.task_id
+    );
+    assert_eq!(
+        tasks
+            .first()
+            .unwrap_or_else(|| panic!("expected task"))
+            .tool_name
+            .as_deref(),
         Some("run_terminal_cmd"),
         "the creator tool is named from the live toolset"
     );
@@ -235,9 +281,19 @@ async fn list_background_tasks_rpc_stays_truthful_across_rebinds() {
     assert_eq!(outcome, RebindOutcome::Reresolved);
     let tasks = list_tasks(&handler).await;
     assert_eq!(tasks.len(), 1, "the task must survive the toolset swap");
-    assert_eq!(tasks[0].task_id, bg.task_id);
     assert_eq!(
-        tasks[0].tool_name, None,
+        tasks
+            .first()
+            .unwrap_or_else(|| panic!("expected task"))
+            .task_id,
+        bg.task_id
+    );
+    assert_eq!(
+        tasks
+            .first()
+            .unwrap_or_else(|| panic!("expected task"))
+            .tool_name,
+        None,
         "the swapped-in toolset has no execute tool to name"
     );
     session.terminal_backend().kill_task(&bg.task_id).await;
@@ -247,9 +303,6 @@ async fn list_background_tasks_rpc_stays_truthful_across_rebinds() {
         "a killed task must leave the outstanding list: {tasks:?}"
     );
 }
-/// `workspace.tasks_snapshot` (GC-614 part 3): returns the outstanding
-/// background task with kind/started_at, plus scheduled tasks (empty when
-/// no scheduler resource exists), and drops the task once killed.
 #[tokio::test]
 async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
     let handle = make_handle();
@@ -285,7 +338,10 @@ async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
         1,
         "the running task must be listed"
     );
-    let task = &snap.background_tasks[0];
+    let task = snap
+        .background_tasks
+        .first()
+        .unwrap_or_else(|| panic!("expected background task"));
     assert_eq!(task.task_id, bg.task_id);
     assert_eq!(task.kind, "bash");
     assert!(
@@ -338,7 +394,10 @@ async fn tasks_snapshot_rpc_lists_outstanding_background_tasks() {
     }
     let snap = snapshot(&handler).await;
     assert_eq!(snap.scheduled_tasks.len(), 1);
-    let loop_task = &snap.scheduled_tasks[0];
+    let loop_task = snap
+        .scheduled_tasks
+        .first()
+        .unwrap_or_else(|| panic!("expected scheduled task"));
     assert_eq!(loop_task.task_id, "loop-1");
     assert_eq!(loop_task.prompt, "check CI");
     assert_eq!(loop_task.human_schedule, "every 5 minutes");
@@ -414,8 +473,6 @@ async fn seed_scheduled_task(toolset: &FinalizedToolset, id: &str) {
     task.id = id.into();
     state.tasks.push(task);
 }
-/// `workspace.kill_task`: kills a running BG task and reports not_found for
-/// unknown ids; after kill the task leaves `tasks_snapshot`.
 #[tokio::test]
 async fn kill_task_rpc_terminates_outstanding_background_task() {
     use xai_grok_workspace_types::rpc::workspace::{KillTaskOutcome, KillTaskResponse};
@@ -466,8 +523,6 @@ async fn kill_task_rpc_terminates_outstanding_background_task() {
         snap.background_tasks
     );
 }
-/// FG in-flight out of snapshot; after backgrounding in; completed BG out.
-/// Preconditions ensure a bare `!completed` filter would fail.
 #[tokio::test]
 async fn tasks_snapshot_excludes_foreground_and_completed_processes() {
     use crate::handle::tests::terminal_run_request;
@@ -609,9 +664,6 @@ async fn tasks_snapshot_excludes_foreground_and_completed_processes() {
     session.terminal_backend().kill_task("snap-fg-task").await;
     let _ = fg_join.await;
 }
-/// Evicting one session while another is live must NOT global-drain (which
-/// would close the shared queue for the survivor) — even when the evicted
-/// id is no longer in the session map.
 #[tokio::test]
 async fn handle_evict_keeps_queue_when_other_sessions_live() {
     let handle = make_handle();
@@ -632,9 +684,6 @@ async fn handle_evict_keeps_queue_when_other_sessions_live() {
         "evict of an absent id with live sessions must not global-drain"
     );
 }
-/// Evicting one of several live sessions removes *that* session (full
-/// teardown), keeps the survivors, and does not global-drain the shared
-/// queue. The drain decision is made on the post-removal map.
 #[tokio::test]
 async fn handle_evict_nonlast_removes_session_and_preserves_survivors() {
     let handle = make_handle();
@@ -663,9 +712,6 @@ async fn handle_evict_nonlast_removes_session_and_preserves_survivors() {
         "evicting a non-last session must not global-drain the shared queue"
     );
 }
-/// Once a terminal evict drain has started, a racing `bind`/create must be
-/// rejected so the shared upload queue is never torn down under a fresh
-/// session (race #3).
 #[tokio::test]
 async fn bind_rejected_after_evict_drain() {
     let handle = make_handle();
@@ -682,8 +728,6 @@ async fn bind_rejected_after_evict_drain() {
         Err(WorkspaceError::ShuttingDown)
     ));
 }
-/// A duplicate / retried evict of the last session must not re-run the
-/// drain or downgrade terminal `ShuttingDown` back to `Draining`.
 #[tokio::test]
 async fn repeat_evict_does_not_redrain() {
     use xai_tool_protocol::ToolServerLifecycleStatus;
@@ -816,9 +860,6 @@ fn baseline_config_value() -> Value {
     serde_json::to_value(crate::session::tool_config::test_support::baseline_config())
         .expect("baseline config serializes")
 }
-/// With both an envelope session and a (spoofed) param, the envelope
-/// wins: the call is authorized as the envelope session and the
-/// mismatch is counted.
 #[tokio::test]
 async fn dispatch_update_tool_config_envelope_overrides_param() {
     let mismatch_before = caller_mismatch_count("update_tool_config", "param_mismatch");
@@ -841,9 +882,6 @@ async fn dispatch_update_tool_config_envelope_overrides_param() {
         "the param/envelope disagreement must be counted"
     );
 }
-/// A forged `caller_session_id` param cannot authorize a cross-session
-/// mutation: the envelope session is the caller and differs from the
-/// target, so the target's caller-equals-target check rejects it.
 #[tokio::test]
 async fn dispatch_update_tool_config_envelope_cross_session_unauthorized() {
     let handle = make_handle();
@@ -865,9 +903,6 @@ async fn dispatch_update_tool_config_envelope_cross_session_unauthorized() {
         "the target session must be untouched"
     );
 }
-/// Compat: without an envelope session (old call paths) the param is
-/// still honored, and the fallback is counted for the deprecation
-/// monitor.
 #[tokio::test]
 async fn dispatch_update_tool_config_param_fallback_without_envelope() {
     let absent_before = caller_mismatch_count("update_tool_config", "envelope_absent");
@@ -887,12 +922,6 @@ async fn dispatch_update_tool_config_param_fallback_without_envelope() {
         "the envelope-absent fallback must be counted"
     );
 }
-/// The intended steady state once clients drop the deprecated param:
-/// envelope-only identity (no `caller_session_id` in params) authorizes.
-/// Counter non-advance is asserted by
-/// [`resolve_mutation_caller_clean_arms_count_nothing`], which uses a
-/// test-unique method label — the real label is shared with concurrently
-/// running dispatch tests, so an equality assert here would flake.
 #[tokio::test]
 async fn dispatch_update_tool_config_envelope_only_without_param() {
     let handle = make_handle();
@@ -909,9 +938,6 @@ async fn dispatch_update_tool_config_envelope_only_without_param() {
         "envelope-only identity must authorize: {result:?}"
     );
 }
-/// The two clean `resolve_mutation_caller` arms — envelope-only and
-/// envelope+matching-param — resolve to the envelope without ticking
-/// either deprecation-monitor kind.
 #[test]
 fn resolve_mutation_caller_clean_arms_count_nothing() {
     const METHOD: &str = "test_clean_arms";
@@ -934,9 +960,6 @@ fn resolve_mutation_caller_clean_arms_count_nothing() {
         "clean arms must not count an envelope-absent fallback"
     );
 }
-/// `drop_session` gets the same envelope-derived identity: a spoofed
-/// param is ignored when the envelope authorizes the drop, and the
-/// mutation audit counter advances.
 #[tokio::test]
 async fn dispatch_drop_session_envelope_overrides_param() {
     let mutation_before = WORKSPACE_RPC_MUTATION_TOTAL
@@ -958,8 +981,6 @@ async fn dispatch_drop_session_envelope_overrides_param() {
         "the mutation audit counter must advance"
     );
 }
-/// A cross-session drop forged via the param is rejected off the
-/// envelope identity and the target survives.
 #[tokio::test]
 async fn dispatch_drop_session_envelope_cross_session_unauthorized() {
     let handle = make_handle();
@@ -977,8 +998,6 @@ async fn dispatch_drop_session_envelope_cross_session_unauthorized() {
         "the target session must survive"
     );
 }
-/// `configure_mcp`'s on-demand session create opts into system
-/// notifications, like every other sandbox-path creator.
 #[tokio::test]
 async fn dispatch_configure_mcp_on_demand_create_enables_system_notifications() {
     let handle = make_handle();
@@ -1258,10 +1277,6 @@ async fn handle_call_error_envelope() {
         other => panic!("expected Terminal(Ok(envelope)), got {other:?}"),
     }
 }
-/// `handle_call` records the RPC metrics: a known method increments its
-/// per-method `ok` series, and an unrecognized method collapses to
-/// `method="unknown",result="error"` — never creating a per-bad-method
-/// series (the cardinality-bounding guarantee).
 #[tokio::test]
 async fn handle_call_records_rpc_metrics_and_collapses_unknown_method() {
     let handler = WorkspaceRpcHandler::new(make_handle());
@@ -1410,36 +1425,6 @@ async fn handle_hook_before_turn_sets_turn_state() {
     );
 }
 #[tokio::test]
-async fn handle_hook_after_turn_does_not_panic() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle.clone());
-    handle.activity_tracker().turn_started("main", 1);
-    let payload = turn_hook::AfterTurnPayload {
-        turn_number: 1,
-        outcome: turn_hook::TurnHookOutcome::Completed,
-        duration_ms: 500,
-        tool_call_count: 3,
-        model_id: "grok-3".to_string(),
-        written_repo_paths: Vec::new(),
-        cancellation_category: None,
-        cancellation_context: None,
-    };
-    let frame = HookFrame {
-        session_id: SessionId::new("main").unwrap(),
-        tool_id: None,
-        call_id: None,
-        hook_id: None,
-        event: HookEvent::Custom {
-            kind: turn_hook::AFTER_TURN_KIND.to_string(),
-            payload: serde_json::to_value(&payload).unwrap(),
-        },
-        trace_context: None,
-    };
-    handler
-        .handle_hook(SessionId::new("main").unwrap(), frame)
-        .await;
-}
-#[tokio::test]
 async fn handle_hook_malformed_payload_does_not_panic() {
     let handle = make_handle();
     let handler = WorkspaceRpcHandler::new(handle);
@@ -1548,7 +1533,6 @@ async fn handle_hook_session_ended_clears_turn_active() {
     );
 }
 use crate::workspace_ops::{GetFilesRes, PutFilesRes};
-/// Helper: compute SHA-256 hex digest for test assertions.
 fn test_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(data))
@@ -1567,19 +1551,34 @@ async fn dispatch_put_files_writes_and_returns_hash() {
         .expect("dispatch should succeed");
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].ok, "write should succeed");
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
+        "write should succeed"
+    );
     let expected_hash = test_sha256(b"hello world");
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(expected_hash.as_str()),
         "hash should be SHA-256 of written content"
     );
-    assert!(res.results[0].error.is_none(), "no error expected");
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+            .is_none(),
+        "no error expected"
+    );
     let on_disk = std::fs::read_to_string(root.join("test_file.txt")).unwrap();
     assert_eq!(on_disk, "hello world");
 }
-/// A bound session's cwd rebases `put_files` / `get_files`; a session-less
-/// dispatch keeps the root.
 #[tokio::test]
 async fn dispatch_put_get_files_resolve_against_bound_session_cwd() {
     let handle = make_handle();
@@ -1597,7 +1596,17 @@ async fn dispatch_put_get_files_resolve_against_bound_session_cwd() {
         .await
         .expect("dispatch should succeed");
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
-    assert!(res.results[0].ok, "{:?}", res.results[0].error);
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
+        "{:?}",
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+    );
     let on_disk = std::fs::read_to_string(root.join("artifacts").join("out.txt")).unwrap();
     assert_eq!(on_disk, "rebased");
     let params = serde_json::json!({ "files": [{"path": "out.txt"}] });
@@ -1606,14 +1615,31 @@ async fn dispatch_put_get_files_resolve_against_bound_session_cwd() {
         .await
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
-    assert!(res.results[0].exists);
-    assert_eq!(res.results[0].content.as_deref(), Some("rebased"));
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
+    assert_eq!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .as_deref(),
+        Some("rebased")
+    );
     let result = handler
         .dispatch("workspace.get_files", params, None)
         .await
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
-    assert!(!res.results[0].exists);
+    assert!(
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
 }
 #[tokio::test]
 async fn dispatch_put_files_rejects_path_traversal() {
@@ -1628,15 +1654,26 @@ async fn dispatch_put_files_rejects_path_traversal() {
         .expect("dispatch itself should succeed");
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(!res.results[0].ok, "path traversal should be rejected");
     assert!(
-        res.results[0]
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
+        "path traversal should be rejected"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
             .error
             .as_ref()
             .unwrap()
             .contains("escapes workspace root"),
         "error should mention escape: {:?}",
-        res.results[0].error
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
     );
 }
 #[tokio::test]
@@ -1655,10 +1692,18 @@ async fn dispatch_resolve_file_references_rejects_outside_root_when_confined() {
     let arr = result.as_array().expect("results array");
     assert_eq!(arr.len(), 2);
     for entry in arr {
-        assert_eq!(entry["exists"], serde_json::Value::Bool(false));
-        assert_eq!(entry["content"], serde_json::Value::Null);
+        assert_eq!(
+            entry.get("exists").unwrap_or(&serde_json::Value::Null),
+            &serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            entry.get("content").unwrap_or(&serde_json::Value::Null),
+            &serde_json::Value::Null
+        );
         assert!(
-            entry["error"]
+            entry
+                .get("error")
+                .unwrap_or(&serde_json::Value::Null)
                 .as_str()
                 .unwrap_or_default()
                 .contains("escapes workspace root"),
@@ -1667,8 +1712,6 @@ async fn dispatch_resolve_file_references_rejects_outside_root_when_confined() {
     }
     std::fs::remove_file(&secret).ok();
 }
-/// On a confining server, refs from a rebased session cannot climb out of
-/// the client-fs base, even to paths still inside the workspace root.
 #[tokio::test]
 async fn dispatch_resolve_file_references_confines_to_session_base() {
     let handle = make_confining_handle();
@@ -1689,19 +1732,19 @@ async fn dispatch_resolve_file_references_confines_to_session_base() {
         .await
         .expect("dispatch itself should succeed");
     let arr = result.as_array().expect("results array");
-    assert_eq!(arr[0]["exists"], serde_json::Value::Bool(false));
-    assert_eq!(arr[0]["content"], serde_json::Value::Null);
+    let Some(entry) = arr.first() else {
+        panic!("expected resolve result: {arr:?}");
+    };
+    assert_eq!(entry.get("exists"), Some(&serde_json::Value::Bool(false)));
+    assert_eq!(entry.get("content"), Some(&serde_json::Value::Null));
     assert!(
-        arr[0]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("escapes workspace root"),
-        "escape above the base should be rejected: {:?}",
-        arr[0]
+        entry
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("escapes workspace root")),
+        "escape above the base should be rejected: {entry:?}"
     );
 }
-/// Relative @-mention refs resolve against the bound session's client-fs
-/// base, matching the paths the files pane hands out.
 #[tokio::test]
 async fn dispatch_resolve_file_references_uses_bound_session_base() {
     let handle = make_handle();
@@ -1722,26 +1765,11 @@ async fn dispatch_resolve_file_references_uses_bound_session_base() {
         .await
         .expect("dispatch should succeed");
     let arr = result.as_array().expect("results array");
-    assert_eq!(arr[0]["exists"], serde_json::Value::Bool(true));
-    assert_eq!(arr[0]["content"], serde_json::json!("rebased"));
-}
-#[tokio::test]
-async fn handle_hook_pause_resume_are_noops() {
-    let handle = make_handle();
-    let handler = WorkspaceRpcHandler::new(handle);
-    for event in [HookEvent::Pause, HookEvent::Resume] {
-        let frame = HookFrame {
-            session_id: SessionId::new("main").unwrap(),
-            tool_id: None,
-            call_id: None,
-            hook_id: None,
-            event,
-            trace_context: None,
-        };
-        handler
-            .handle_hook(SessionId::new("main").unwrap(), frame)
-            .await;
-    }
+    let Some(entry) = arr.first() else {
+        panic!("expected resolve result: {arr:?}");
+    };
+    assert_eq!(entry.get("exists"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(entry.get("content"), Some(&serde_json::json!("rebased")));
 }
 #[tokio::test]
 async fn dispatch_put_files_rejects_absolute_outside_root() {
@@ -1757,17 +1785,25 @@ async fn dispatch_put_files_rejects_absolute_outside_root() {
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
     assert!(
-        !res.results[0].ok,
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
         "absolute path outside root should be rejected"
     );
     assert!(
-        res.results[0]
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
             .error
             .as_ref()
             .unwrap()
             .contains("escapes workspace root"),
         "error should mention escape: {:?}",
-        res.results[0].error
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
     );
 }
 #[tokio::test]
@@ -1786,9 +1822,15 @@ async fn dispatch_put_files_accepts_absolute_within_root() {
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
     assert!(
-        res.results[0].ok,
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
         "absolute path within root should be accepted: {:?}",
-        res.results[0].error
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
     );
     assert_eq!(
         std::fs::read_to_string(root.join("sub/abs.txt")).unwrap(),
@@ -1812,15 +1854,26 @@ async fn dispatch_put_files_rejects_symlink_escape() {
         .expect("dispatch itself should succeed");
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(!res.results[0].ok, "symlink escape should be rejected");
     assert!(
-        res.results[0]
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
+        "symlink escape should be rejected"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
             .error
             .as_ref()
             .unwrap()
             .contains("symlink escape"),
         "error should mention symlink: {:?}",
-        res.results[0].error
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
     );
     assert!(
         !outside.path().join("evil.txt").exists(),
@@ -1844,15 +1897,42 @@ async fn dispatch_put_files_partial_failure() {
         .expect("dispatch should succeed");
     let res: PutFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 2);
-    assert!(res.results[0].ok, "first file should succeed");
-    assert!(res.results[0].hash.is_some(), "first file should have hash");
-    assert!(!res.results[1].ok, "second file should fail");
     assert!(
-        res.results[1].error.is_some(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok,
+        "first file should succeed"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .is_some(),
+        "first file should have hash"
+    );
+    assert!(
+        !res.results
+            .get(1)
+            .unwrap_or_else(|| panic!("expected result 1"))
+            .ok,
+        "second file should fail"
+    );
+    assert!(
+        res.results
+            .get(1)
+            .unwrap_or_else(|| panic!("expected result 1"))
+            .error
+            .is_some(),
         "second file should have error"
     );
     assert!(
-        res.results[1].hash.is_none(),
+        res.results
+            .get(1)
+            .unwrap_or_else(|| panic!("expected result 1"))
+            .hash
+            .is_none(),
         "failed file should have no hash"
     );
     let on_disk = std::fs::read_to_string(root.join("good.txt")).unwrap();
@@ -1874,25 +1954,53 @@ async fn dispatch_get_files_reads_existing_file() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists, "file should exist");
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists,
+        "file should exist"
+    );
     assert_eq!(
-        res.results[0].content.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .as_deref(),
         Some(content),
         "content should match what was written"
     );
     let expected_hash = test_sha256(content.as_bytes());
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(expected_hash.as_str()),
         "hash should be SHA-256 of file content"
     );
-    assert!(!res.results[0].matched);
+    assert!(
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched
+    );
     assert_eq!(
-        res.results[0].size,
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .size,
         Some(content.len() as u64),
         "size should match content length"
     );
-    assert!(res.results[0].error.is_none());
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+            .is_none()
+    );
 }
 #[tokio::test]
 async fn dispatch_get_files_nonexistent_returns_not_exists() {
@@ -1907,12 +2015,39 @@ async fn dispatch_get_files_nonexistent_returns_not_exists() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(!res.results[0].exists, "file should not exist");
-    assert!(res.results[0].content.is_none());
-    assert!(res.results[0].hash.is_none());
-    assert!(!res.results[0].matched);
     assert!(
-        res.results[0].error.is_none(),
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists,
+        "file should not exist"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .is_none()
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .is_none()
+    );
+    assert!(
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+            .is_none(),
         "missing file is not an error"
     );
 }
@@ -1931,13 +2066,32 @@ async fn dispatch_get_files_io_error_returns_exists_true() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists, "directory exists on disk");
     assert!(
-        res.results[0].error.is_some(),
-        "reading a directory as file should fail: {:?}",
-        res.results[0]
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists,
+        "directory exists on disk"
     );
-    assert!(res.results[0].content.is_none(), "no content on error");
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+            .is_some(),
+        "reading a directory as file should fail: {:?}",
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .is_none(),
+        "no content on error"
+    );
 }
 #[tokio::test]
 async fn dispatch_get_files_non_utf8_returns_error_with_hash() {
@@ -1955,28 +2109,50 @@ async fn dispatch_get_files_non_utf8_returns_error_with_hash() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists, "file should exist");
     assert!(
-        res.results[0].content.is_none(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists,
+        "file should exist"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .is_none(),
         "non-UTF-8 content should be None"
     );
     let expected_hash = test_sha256(binary_content);
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(expected_hash.as_str()),
         "hash should be SHA-256 of file content even for non-UTF-8 files"
     );
     assert!(
-        res.results[0]
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
             .error
             .as_ref()
             .unwrap()
             .contains("not valid UTF-8"),
         "error should mention UTF-8: {:?}",
-        res.results[0].error
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
     );
     assert_eq!(
-        res.results[0].size,
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .size,
         Some(4),
         "size should still be reported"
     );
@@ -1998,18 +2174,43 @@ async fn dispatch_get_files_cache_hit() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists);
-    assert!(res.results[0].matched, "should be a cache hit");
     assert!(
-        res.results[0].content.is_none(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched,
+        "should be a cache hit"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .is_none(),
         "content should be omitted on cache hit"
     );
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(expected_hash.as_str()),
         "hash should still be returned"
     );
-    assert!(res.results[0].error.is_none());
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .error
+            .is_none()
+    );
 }
 #[tokio::test]
 async fn dispatch_get_files_cache_miss() {
@@ -2027,16 +2228,35 @@ async fn dispatch_get_files_cache_miss() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists);
-    assert!(!res.results[0].matched, "should be a cache miss");
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
+    assert!(
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched,
+        "should be a cache miss"
+    );
     assert_eq!(
-        res.results[0].content.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .as_deref(),
         Some(content),
         "content should be returned on miss"
     );
     let expected_hash = test_sha256(content.as_bytes());
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(expected_hash.as_str()),
         "current hash should be returned"
     );
@@ -2054,8 +2274,20 @@ async fn dispatch_put_then_get_round_trip() {
         .await
         .expect("put should succeed");
     let put_res: PutFilesRes = serde_json::from_value(put_result).unwrap();
-    assert!(put_res.results[0].ok);
-    let put_hash = put_res.results[0].hash.clone().unwrap();
+    assert!(
+        put_res
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .ok
+    );
+    let put_hash = put_res
+        .results
+        .first()
+        .unwrap_or_else(|| panic!("expected result 0"))
+        .hash
+        .clone()
+        .unwrap();
     let get_params = serde_json::json!({
         "files": [{"path": "round_trip.txt"}]
     });
@@ -2064,14 +2296,30 @@ async fn dispatch_put_then_get_round_trip() {
         .await
         .expect("get should succeed");
     let get_res: GetFilesRes = serde_json::from_value(get_result).unwrap();
-    assert!(get_res.results[0].exists);
+    assert!(
+        get_res
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
     assert_eq!(
-        get_res.results[0].content.as_deref(),
+        get_res
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .as_deref(),
         Some(content),
         "content should match what was written"
     );
     assert_eq!(
-        get_res.results[0].hash.as_deref(),
+        get_res
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(put_hash.as_str()),
         "get hash should match put hash"
     );
@@ -2089,8 +2337,19 @@ async fn dispatch_put_files_append_mode() {
         .await
         .expect("first chunk should succeed");
     let put1: PutFilesRes = serde_json::from_value(res1).unwrap();
-    assert!(put1.results[0].ok);
-    let chunk1_hash = put1.results[0].hash.clone().unwrap();
+    assert!(
+        put1.results
+            .first()
+            .unwrap_or_else(|| panic!("expected put1 result"))
+            .ok
+    );
+    let chunk1_hash = put1
+        .results
+        .first()
+        .unwrap_or_else(|| panic!("expected put1 result"))
+        .hash
+        .clone()
+        .unwrap();
     assert_eq!(
         chunk1_hash,
         test_sha256(b"hello"),
@@ -2104,8 +2363,19 @@ async fn dispatch_put_files_append_mode() {
         .await
         .expect("second chunk should succeed");
     let put2: PutFilesRes = serde_json::from_value(res2).unwrap();
-    assert!(put2.results[0].ok);
-    let chunk2_hash = put2.results[0].hash.clone().unwrap();
+    assert!(
+        put2.results
+            .first()
+            .unwrap_or_else(|| panic!("expected put2 result"))
+            .ok
+    );
+    let chunk2_hash = put2
+        .results
+        .first()
+        .unwrap_or_else(|| panic!("expected put2 result"))
+        .hash
+        .clone()
+        .unwrap();
     assert_eq!(
         chunk2_hash,
         test_sha256(b" world"),
@@ -2130,21 +2400,42 @@ async fn dispatch_get_files_byte_range() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists);
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
     assert_eq!(
-        res.results[0].content.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .as_deref(),
         Some("3456"),
         "should return only the requested byte range"
     );
     let full_hash = test_sha256(content.as_bytes());
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(full_hash.as_str()),
         "hash should be of the full file, not the chunk"
     );
-    assert!(!res.results[0].matched);
+    assert!(
+        !res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched
+    );
     assert_eq!(
-        res.results[0].size,
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .size,
         Some(content.len() as u64),
         "size should be full file size"
     );
@@ -2171,25 +2462,44 @@ async fn dispatch_get_files_byte_range_cache_hit() {
         .expect("dispatch should succeed");
     let res: GetFilesRes = serde_json::from_value(result).unwrap();
     assert_eq!(res.results.len(), 1);
-    assert!(res.results[0].exists);
-    assert!(res.results[0].matched, "should be a cache hit");
     assert!(
-        res.results[0].content.is_none(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .exists
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .matched,
+        "should be a cache hit"
+    );
+    assert!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .content
+            .is_none(),
         "content should be omitted on cache hit"
     );
     assert_eq!(
-        res.results[0].hash.as_deref(),
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .hash
+            .as_deref(),
         Some(full_hash.as_str()),
         "hash should still be returned"
     );
-    assert_eq!(res.results[0].size, Some(10));
+    assert_eq!(
+        res.results
+            .first()
+            .unwrap_or_else(|| panic!("expected result 0"))
+            .size,
+        Some(10)
+    );
 }
-/// Every type with a `WorkspaceRpc` impl must be routed by `dispatch()`.
-///
-/// Each entry is compiler-checked via `<X as WorkspaceRpc>::METHOD`.
-/// Dispatching `{}` may fail with any per-method error (invalid params,
-/// session not found, not a git repo) — only an "unknown workspace
-/// method" error fails the test.
 #[tokio::test]
 async fn dispatch_knows_every_typed_method() {
     use crate::file_system::{
@@ -2269,6 +2579,9 @@ async fn dispatch_knows_every_typed_method() {
         <ApplyWorktreeRequest as WorkspaceRpc>::METHOD,
         <WorktreeListReq as WorkspaceRpc>::METHOD,
         <WorktreeShowReq as WorkspaceRpc>::METHOD,
+        <WorktreeDetachReq as WorkspaceRpc>::METHOD,
+        <WorktreeSalvageReq as WorkspaceRpc>::METHOD,
+        <WorktreeCleanArtifactsReq as WorkspaceRpc>::METHOD,
         <WorktreeDbPathReq as WorkspaceRpc>::METHOD,
         <WorktreeDbStatsReq as WorkspaceRpc>::METHOD,
         <PrepareWorktreeFromWorktreeReq as WorkspaceRpc>::METHOD,
@@ -2307,9 +2620,6 @@ async fn dispatch_knows_every_typed_method() {
         }
     }
 }
-/// Mutation-classed methods stamp client-RPC activity (even on invalid
-/// params — the call itself is the evidence of a live client); reads and
-/// the deliberate teardown exception never do.
 #[tokio::test]
 async fn dispatch_stamps_client_rpc_activity_for_mutations_only() {
     use crate::file_system::{FsListReq, FsWriteFileReq};

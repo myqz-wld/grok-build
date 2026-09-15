@@ -2171,6 +2171,7 @@ mod tests {
 
     #[test]
     fn long_answer_card_cache_hits_on_idle_and_hover_redraws_and_invalidates_precisely() {
+        let _theme = crate::theme::cache::pin_theme();
         let mut thread = completed_thread();
         thread.exchanges[0].answer_markdown =
             "A paragraph with **formatting** and `code`.\n\n".repeat(2_000);
