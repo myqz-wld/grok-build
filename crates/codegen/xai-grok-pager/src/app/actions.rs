@@ -9,6 +9,7 @@ use super::agent::AgentId;
 use crate::app::status_line::StatusLineRun;
 use crate::scrollback::entry::EntryId;
 use agent_client_protocol as acp;
+use std::num::NonZeroU64;
 use xai_grok_shell::sampling::types::ReasoningEffort;
 use xai_grok_shell::session::unified_list::SessionKind;
 /// Typed error for model switch failures.
@@ -26,6 +27,24 @@ pub enum SwitchModelError {
     },
     /// Any other failure (network, auth, server error, etc.).
     Other(String),
+}
+/// The model, effort, and context window a session switch requests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelChoice {
+    pub model_id: acp::ModelId,
+    pub effort: Option<ReasoningEffort>,
+    /// `None` keeps the session's context window selection.
+    pub context_window_selection: Option<NonZeroU64>,
+}
+impl ModelChoice {
+    /// Chooses `model_id` with no effort override and the session's context window.
+    pub fn new(model_id: acp::ModelId) -> Self {
+        ModelChoice {
+            model_id,
+            effort: None,
+            context_window_selection: None,
+        }
+    }
 }
 /// Synchronous, side-effect-free user intent.
 /// Produced by [`super::input`] from key/mouse events.
@@ -185,6 +204,9 @@ pub enum Action {
         text: String,
         /// Pasted images riding along with the prompt.
         images: Vec<crate::prompt_images::PastedImage>,
+        /// Notice raised while the composer was consumed (a placeholder no image backs); the key
+        /// handler has no `AppView`, so it travels with the send and is queued when it dispatches.
+        image_notice: Option<String>,
     },
     /// Enable session voice mode and start recording (the Ctrl+Space hold-to-talk key-press, on terminals that report key releases).
     /// Start-only, never stops; use [`Self::VoiceStop`], [`Self::VoiceToggle`], or Esc to stop.
@@ -324,7 +346,7 @@ pub enum Action {
     /// Disabling it lets the terminal handle native click-drag text selection and copy-paste; re-enabling restores in-app mouse handling.
     /// Bound to Ctrl+R while the scrollback pane is focused.
     ToggleMouseCapture,
-    /// Toggle the scroll-diagnostics HUD (hidden `/scroll-debug` command, also `/debug scroll`; `GROK_SCROLL_DEBUG=1` enables it from startup).
+    /// Toggle the scroll-diagnostics HUD (`/debug scroll`; `GROK_SCROLL_DEBUG=1` enables it from startup).
     ToggleScrollDebugHud,
     /// Toggle the release-safe FPS HUD (`/debug fps`).
     ToggleFpsHud,
@@ -412,10 +434,7 @@ pub enum Action {
     /// Cycle to next model.
     NextModel,
     /// Switch active model.
-    SwitchModel {
-        model_id: acp::ModelId,
-        effort: Option<ReasoningEffort>,
-    },
+    SwitchModel(ModelChoice),
     /// Cancel the currently running turn.
     CancelTurn,
     /// User confirmed a cancel-turn choice from the panel.
@@ -429,11 +448,6 @@ pub enum Action {
     DemoteToBackground,
     /// Request current bundle cache status via `x.ai/bundle/status`.
     RequestBundleStatus,
-    /// View a catalog entry's raw content in the block viewer.
-    ViewCatalogEntry {
-        kind: String,
-        name: String,
-    },
     /// Hide the announcements banner.
     AnnouncementsHide,
     /// Show the announcements banner.
@@ -472,6 +486,11 @@ pub enum Action {
     SetRememberToolApprovals(bool),
     /// Toggle the ask_user_question timeout. SHELL-owned; persisted to `[toolset.ask_user_question].timeout_enabled`. Applies to new sessions.
     SetAskUserQuestionTimeoutEnabled(bool),
+    /// Save `[features].subagent_model_inheritance` as an explicit override. SHELL-owned; agents latch it when built, so it applies on restart.
+    SetSubagentModelInheritance(bool),
+    /// Delete the saved `[features].subagent_model_inheritance` key so the remote setting or the default applies again.
+    /// The reset path uses this instead of writing the compiled default.
+    ClearSubagentModelInheritance,
     /// SHELL-owned `keep_text_selection` (`flash` | `hold`); cache and persist.
     SetKeepTextSelection(crate::appearance::TextSelection),
     /// Set the mouse-wheel scroll speed multiplier (1-100).
@@ -525,6 +544,8 @@ pub enum Action {
     SetTimestamps(bool),
     /// Set timeline sidebar visibility (per-turn tick rail).
     SetTimeline(bool),
+    /// This action saves `[ui].dashboard_preview`.
+    SetDashboardPreview(bool),
     /// Set `[ui].page_flip_on_send` (default ON). Persists via `Effect::PersistSetting`.
     SetPageFlipOnSend(bool),
     /// Set `[ui].confirm_before_rewind` (default ON). Persists via `Effect::PersistSetting`.
@@ -597,7 +618,7 @@ pub enum Action {
     },
     /// Privacy banner `[Opt in]` (ack only after ACP success).
     PrivacyBannerOptIn,
-    /// Privacy banner `[Opt out]` (ack now, then record the decline).
+    /// Privacy banner `[Opt out]` (always writes the decline; ack only after ACP success).
     PrivacyBannerOptOut,
     /// Open the command palette (`/help`).
     /// The keybinding path (Ctrl+P) opens it directly in `handle_agent_action`; this lets a slash command reach the same modal through dispatch.
@@ -784,6 +805,14 @@ pub enum Action {
     DoctorFixCancelled(DoctorFixTarget),
     /// Persist the memory modal fullscreen preference to config.toml.
     PersistMemoryFullscreen(bool),
+    /// Turn memory on or off for the active session (`t` in the `/memory` modal).
+    MemoryToggle {
+        enabled: bool,
+    },
+    /// Copy text from the `/memory` modal; the outcome is shown in the modal's status line.
+    MemoryCopy {
+        text: String,
+    },
     /// Delete one note from the `/memory` modal; the shell verifies the hash before removing.
     MemoryForget {
         path: String,
@@ -793,7 +822,7 @@ pub enum Action {
     OpenDashboard,
     /// Close the dashboard, returning to the previous `ActiveView`.
     ExitDashboard,
-    /// Attach to a dashboard row: switches to the parent agent and (for subagent rows) sets the parent's `active_subagent`.
+    /// Attach to a dashboard row: switches to that agent's view.
     DashboardAttach(crate::views::dashboard::DashboardRowId),
     DashboardCloseSessionPicker,
     DashboardPickSession(usize),
@@ -947,8 +976,6 @@ pub enum Action {
     RewindCancelOffer,
     RewindDismiss,
     RewindDismissError,
-    /// Submit an inline edit: conversation-only rewind to that prompt, then resubmit the edited text (state lives on `AgentView::inline_edit`).
-    InlineEditSubmit,
     /// Open the `/jump` turn picker.
     JumpShowPicker,
     /// Jump to a turn by its prompt's stable id and close the picker.
@@ -1030,24 +1057,19 @@ pub enum PermissionLabel {
     Auto,
     AlwaysApprove,
 }
-impl From<PermissionLabel> for PermissionModeKind {
-    fn from(label: PermissionLabel) -> Self {
-        match label {
-            PermissionLabel::Ask => Self::Ask,
-            PermissionLabel::Auto => Self::Auto,
-            PermissionLabel::AlwaysApprove => Self::AlwaysApprove,
-        }
-    }
-}
 impl PermissionLabel {
-    /// Shares [`PermissionModeKind::as_canonical`] so the info-line flags and the scrollback rows use one string table.
-    pub fn as_canonical(self) -> &'static str {
-        PermissionModeKind::from(self).as_canonical()
+    /// The text the info-line flags and the scrollback rows show. It can differ from the config id.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto-review",
+            Self::AlwaysApprove => "always-approve",
+        }
     }
 }
 impl std::fmt::Display for PermissionLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_canonical())
+        f.write_str(self.display_name())
     }
 }
 #[cfg(test)]
@@ -1437,9 +1459,10 @@ pub enum Effect {
         model_id: Option<acp::ModelId>,
         /// Per-create permission mode for a fresh worktree session. Ignored when resuming an existing session.
         permission_mode_override: Option<PermissionModeKind>,
-        /// Client-chosen session ID (`--session-id` with `--worktree`) used as the worktree/session id and `meta.sessionId` on fresh create.
-        /// Ignored when `load_session_id` is set (resume path owns the id).
+        /// Explicit `--session-id`: names the worktree checkout and is the `meta.sessionId` on create.
         preferred_session_id: Option<String>,
+        /// Pager-minted `meta.sessionId` for a fresh worktree create without an explicit id, so its setup phases route; not the checkout name.
+        minted_session_id: Option<String>,
         /// One-shot `/chat` or sticky `--chat`: stamp `_meta` kind=chat on fresh create (resume uses `LoadSession.chat_kind` instead).
         chat_kind: bool,
     },
@@ -1633,7 +1656,6 @@ pub enum Effect {
     Compact {
         agent_id: AgentId,
         session_id: acp::SessionId,
-        user_context: Option<String>,
     },
     /// Kill a background task.
     KillBgTask {
@@ -1660,8 +1682,7 @@ pub enum Effect {
     SwitchModel {
         agent_id: AgentId,
         session_id: acp::SessionId,
-        model_id: acp::ModelId,
-        effort: Option<ReasoningEffort>,
+        choice: ModelChoice,
         /// The model that was active before the optimistic UI update in `set_default_model`.
         /// `None` for `Action::SwitchModel` (no optimistic update).
         /// Threaded through to `SwitchModelComplete` so `IncompatibleAgent` can roll back.
@@ -1720,6 +1741,12 @@ pub enum Effect {
         key: crate::settings::SettingKey,
         value: crate::settings::SettingValue,
         rollback_value: crate::settings::SettingValue,
+    },
+    /// Write the user `[features]` key of `feature`, or delete it for `saved == None`; completes as
+    /// [`TaskResult::FeatureOverridePersisted`]. A row issues one of these at a time so the disk follows toggle order.
+    PersistFeatureOverride {
+        feature: xai_grok_shell::agent::config::Feature,
+        saved: Option<bool>,
     },
     /// Toggle mouse reporting off and on to unwedge xterm.js's button tracker
     /// (see `AgentView::reset_wedged_mouse_reporting`). An effect so it rides the escape
@@ -1855,12 +1882,33 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
+    /// Fetch the `/memory` modal contents (x.ai/memory/list).
+    FetchMemoryList {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Turn memory on or off (x.ai/memory/toggle).
+    MemoryToggle {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        enabled: bool,
+    },
     /// Delete one memory note from the `/memory` modal (x.ai/memory/forget).
     MemoryForget {
         agent_id: AgentId,
         session_id: acp::SessionId,
         path: String,
         expected_content_hash: String,
+    },
+    /// Run `/flush` (x.ai/memory/flush) as a tracked agent command.
+    MemoryFlush {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Run `/dream` (x.ai/memory/dream) as a tracked agent command.
+    MemoryDream {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
     },
     /// Execute a hooks management action via ACP.
     HooksAction {
@@ -1893,6 +1941,10 @@ pub enum Effect {
     FetchSkillsList {
         agent_id: AgentId,
         session_id: acp::SessionId,
+        /// Rescan the skill folders; otherwise a backend may answer from its cache.
+        refresh: bool,
+        /// The number the Skills tab gave this fetch; only the newest fetch's answer shows.
+        fetch: u64,
     },
     FetchWorkflowsList {
         agent_id: AgentId,
@@ -1995,8 +2047,6 @@ pub enum Effect {
     },
     /// Fetch current bundle cache status via `x.ai/bundle/status`.
     FetchBundleStatus,
-    /// Fetch a bundled entry's raw content via `x.ai/bundle/entry/get`.
-    FetchCatalogEntry { kind: String, name: String },
     /// Send feedback about the current session (fire-and-forget POST).
     /// `origin` rides through to the completion so a modal send's parked consent can be matched or dropped.
     SendFeedback {
@@ -2091,6 +2141,10 @@ pub enum Effect {
     /// Re-check subscription status via `x.ai/auth/check_subscription`.
     /// `verify` scopes the result to a deferred-gate verification (see [`crate::app::subscription`]); `None` for generic checks.
     CheckSubscription { verify: Option<u64> },
+    /// `x.ai/auth/hydrate_team_capability` for `identity`; the answer is dropped if the account changed meanwhile.
+    HydrateTeamCapability {
+        identity: crate::app::app_view::AuthIdentity,
+    },
     /// One-shot subscription re-check triggered by a credit-limit 403.
     /// If the tier changed, the stashed prompt is retried instead of showing the upsell modal.
     CreditLimitRecheck { agent_id: AgentId },
@@ -2107,8 +2161,8 @@ pub enum Effect {
     },
     /// Clear the auth copy feedback after a delay if its generation is still current.
     ScheduleClearAuthCopyFeedback { generation: u64 },
-    /// Register the current session in the active-sessions crash-recovery
-    /// registry (`~/.grok/active_sessions.json`).
+    /// Register the current session in the active-session registry
+    /// (`~/.grok/active_sessions.json`).
     RegisterActiveSession {
         session_id: acp::SessionId,
         cwd: String,
@@ -2121,11 +2175,8 @@ pub enum Effect {
     SetCodingDataSharing {
         agent_id: AgentId,
         opted_in: bool,
-        /// Pre-toggle value to revert to on failure.
-        rollback_to_opted_in: bool,
         /// Write generation, echoed back on the `TaskResult`.
-        /// Writes to this endpoint are concurrent, so a result that isn't the newest must not touch state.
-        /// Its `rollback_to_opted_in` was captured against a world that has since moved on.
+        /// Writes to this endpoint are concurrent, so only the newest result sets the mirror; an older success only updates the pending write's rollback.
         seq: u64,
     },
     /// Rename the current session.
@@ -2189,6 +2240,12 @@ pub enum Effect {
         last_turn_summary_gen: u64,
     },
     FetchRewindPoints {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Stops the running turn, waits for the backend to take the cancel, then fetches the rewind points.
+    /// A backend refuses points while a turn runs, so the order matters.
+    CancelTurnThenFetchRewindPoints {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
@@ -2415,6 +2472,8 @@ pub enum TaskResult {
     SessionFailed {
         agent_id: AgentId,
         error: String,
+        /// The create RPC hit its bounded timeout, rather than failing early for another reason.
+        timed_out: bool,
     },
     /// Worktree session was created successfully (worktree and ACP session).
     WorktreeSessionCreated {
@@ -2447,6 +2506,10 @@ pub enum TaskResult {
     WorktreeSessionFailed {
         agent_id: AgentId,
         error: String,
+        /// The orphaned worktree still on disk, so the handler can re-append the `grok worktree rm` hint; `None` if none was created.
+        orphaned_worktree_root: Option<std::path::PathBuf>,
+        /// The create RPC hit its bounded timeout, rather than failing early for another reason.
+        timed_out: bool,
     },
     /// Session was loaded (resumed) successfully.
     SessionLoaded {
@@ -2739,8 +2802,7 @@ pub enum TaskResult {
     /// Model switch completed (effort, if any, was applied in the same request).
     SwitchModelComplete {
         agent_id: AgentId,
-        model_id: acp::ModelId,
-        effort: Option<ReasoningEffort>,
+        choice: ModelChoice,
         result: Result<(), SwitchModelError>,
         /// Forwarded from `Effect::SwitchModel.prev_model_id` for rollback on `IncompatibleAgent`.
         prev_model_id: Option<acp::ModelId>,
@@ -2814,11 +2876,31 @@ pub enum TaskResult {
         agent_id: AgentId,
         result: Result<xai_hooks_plugins_types::PluginsListResponse, String>,
     },
+    /// Memory listing fetched for the `/memory` modal.
+    MemoryListLoaded {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryListing, String>,
+    },
+    /// Shell answered a memory on/off request.
+    MemoryToggleResult {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryToggleResponse, String>,
+    },
     /// Shell answered a `/memory` modal delete request.
     MemoryForgetResult {
         agent_id: AgentId,
         path: String,
         result: Result<xai_grok_shell::extensions::memory::MemoryForgetResponse, String>,
+    },
+    /// `/flush` finished.
+    MemoryFlushComplete {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryFlushResponse, String>,
+    },
+    /// `/dream` finished.
+    MemoryDreamComplete {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryDreamResponse, String>,
     },
     /// Hooks action completed.
     HooksActionResult {
@@ -2843,7 +2925,9 @@ pub enum TaskResult {
     /// Skills list loaded.
     SkillsListLoaded {
         agent_id: AgentId,
-        result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+        session_id: acp::SessionId,
+        fetch: u64,
+        result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
     },
     WorkflowsListLoaded {
         agent_id: AgentId,
@@ -2853,7 +2937,7 @@ pub enum TaskResult {
     /// Skill toggle completed (enable/disable).
     SkillsToggleDone {
         agent_id: AgentId,
-        result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
+        result: Result<xai_grok_shell::extensions::skills::SkillsListResponse, String>,
     },
     /// Background marketplace auto-update completed.
     MarketplaceUpdatesAvailable {
@@ -2931,7 +3015,6 @@ pub enum TaskResult {
     CodingDataSharingFailed {
         agent_id: AgentId,
         error: String,
-        rollback_to_opted_in: bool,
         seq: u64,
     },
     /// Session rename completed successfully.
@@ -3072,16 +3155,6 @@ pub enum TaskResult {
     BundleStatusFailed {
         error: String,
     },
-    /// Catalog entry content fetched successfully.
-    CatalogEntryReady {
-        kind: String,
-        name: String,
-        content: String,
-    },
-    /// Catalog entry fetch failed.
-    CatalogEntryFailed {
-        error: String,
-    },
     /// Side question (/btw) response received.
     BtwResponse {
         agent_id: AgentId,
@@ -3090,6 +3163,8 @@ pub enum TaskResult {
         minimal_request_id: Option<uuid::Uuid>,
         /// Set when attached images were left out of the side question.
         image_notice: Option<String>,
+        /// Attachments whose bytes could not be loaded; reported by display number.
+        skipped_image_numbers: Vec<usize>,
     },
     /// `x.ai/recap` request acknowledged (fire-and-forget).
     /// The recap itself arrives separately as a `SessionRecap` notification; this only carries a transport error, if any, for logging.
@@ -3111,12 +3186,16 @@ pub enum TaskResult {
     InterjectFailed {
         agent_id: AgentId,
         error: String,
-        text: String,
-        blocks: Option<Vec<agent_client_protocol::ContentBlock>>,
+        remaining: Vec<(
+            String,
+            String,
+            Option<Vec<agent_client_protocol::ContentBlock>>,
+        )>,
     },
     /// Available commands refreshed from the shell.
     AvailableCommandsRefreshed {
         agent_id: AgentId,
+        session_id: acp::SessionId,
         commands: Vec<acp::AvailableCommand>,
     },
     /// Shell acknowledged logout (auth cleared).
@@ -3128,6 +3207,11 @@ pub enum TaskResult {
     CheckSubscriptionComplete {
         verify: Option<u64>,
         meta: Option<serde_json::Value>,
+    },
+    /// `None` is unresolved or a failed RPC; the next launch asks again.
+    TeamCapabilityHydrated {
+        identity: crate::app::app_view::AuthIdentity,
+        can_administer_team: Option<bool>,
     },
     /// Result of the credit-limit subscription re-check.
     /// If the tier changed the stashed prompt is retried; otherwise the upsell is shown.
@@ -3267,6 +3351,11 @@ pub enum TaskResult {
     SettingPersistFailedBestEffort {
         key: crate::settings::SettingKey,
         error: String,
+    },
+    /// One [`Effect::PersistFeatureOverride`] write finished; `Ok` carries what it left on disk.
+    FeatureOverridePersisted {
+        feature: xai_grok_shell::agent::config::Feature,
+        result: Result<Option<bool>, String>,
     },
     /// Off-thread clipboard attachment probe finished (see [`Effect::ProbeClipboardAttachment`]); dispatch attaches the chip.
     ClipboardAttachmentProbed {

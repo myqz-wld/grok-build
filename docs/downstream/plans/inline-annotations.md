@@ -3,7 +3,7 @@
 ## 1. Plan identity
 
 - Goal: add persistent, follow-up-capable inline annotations to historical conversation text in the standard Grok Build TUI.
-- Repository: `/Users/wanglidong/Repository/grok-build`
+- Repository: `grok-build` (paths are repository-relative).
 - Upstream base at planning time: `ba76b0a` on `main`, `origin/main`, and `upstream/main`.
 - Planning date: 2026-07-22.
 - Delivery branch policy:
@@ -416,9 +416,9 @@ Manual smoke test in a standard TUI:
 - Planning: approved by the user on 2026-07-22.
 - Isolation (T1): complete.
 - Implementation: T2–T8 complete; retained remediation review passed.
-- Main repository: `/Users/wanglidong/Repository/grok-build`, still checked out on pristine `main` at `ba76b0a`.
+- Main repository: `grok-build`, still checked out on pristine `main` at `ba76b0a`.
 - Delivered implementation worktree: removed after commit `4928862` was pushed.
-- Active remediation worktree: `/Users/wanglidong/Repository/grok-build-worktrees/inline-annotations-fixes`.
+- Active remediation worktree: isolated `inline-annotations-fixes` checkout.
 - Branches:
   - base: `downstream/main` at `ba76b0a`;
   - delivered feature: `feature/inline-annotations` at `4928862`;
@@ -537,9 +537,8 @@ Manual smoke test in a standard TUI:
   retained, the isolated remediation worktree is removed, and the primary
   repository remains pristine on `main@ba76b0a`.
 - T9 upstream sync start (2026-07-22):
-  - created isolated worktree
-    `/Users/wanglidong/Repository/grok-build-worktrees/upstream-sync-20260722`
-    on `sync/upstream-20260722` from reviewed `downstream/main@44d38cc`;
+  - created an isolated worktree on `sync/upstream-20260722` from reviewed
+    `downstream/main@44d38cc`;
   - fetched and merged `upstream/main@a5727c5` (`grok` 0.2.110), resolving nine
     conflicts while retaining upstream workflows, background/task/external-editor
     shortcuts, overlays, and backend-search APIs together with annotation entry,
@@ -574,9 +573,9 @@ Manual smoke test in a standard TUI:
     `sync/upstream-20260722`, and `downstream/main` is fast-forwarded and
     pushed without force;
   - a release build from the delivered tree is installed at
-    `/Users/wanglidong/.local/bin/grok` as `grok 0.2.110 (8097e18)`;
+    `$HOME/.local/bin/grok` as `grok 0.2.110 (8097e18)`;
     the previous `grok 0.2.106 (ba76b0a)` binary is retained at
-    `/Users/wanglidong/.local/bin/grok.pre-annotations-0.2.106-ba76b0a`;
+    `$HOME/.local/bin/grok.pre-annotations-0.2.106-ba76b0a`;
   - the primary repository remains clean on `main@ba76b0a`.
 - T10 upstream sync and delivery (2026-08-20):
   - fast-forwarded the pristine `main` mirror and merged
@@ -618,7 +617,10 @@ Manual smoke test in a standard TUI:
   (Grok 1.0.32) while retaining annotations and Responses Lite fallbacks.
   The detailed conflict resolutions, validation, deployment, and rollback
   status are in [the sync record](upstream-sync-20260915.md).
-- Current state: T8–T11 are complete. Grok 1.0.32 (`be4bb23da4c2`) is
-  installed locally with a verified backup. `downstream/main` and the pristine
-  `main` mirror are published; the primary workspace is restored and the
-  temporary worktree is removed.
+- T12 upstream sync (2026-10-11): integrating `upstream/main@2bdd1d6a`
+  (Grok 1.0.45), preserving annotations and Responses Lite fallbacks.
+  See [the sync record](upstream-sync-20261011.md) for current validation
+  and local installation progress.
+- Current state: T8–T11 are complete; T12 validation is in progress. The
+  previous Grok 1.0.32 installation remains active until release validation
+  succeeds.

@@ -133,14 +133,17 @@ async fn annotation_actor_rejects_unexpected_tool_calls_before_dispatch() {
             install_annotation_toolset(&actor).await;
 
             let err = actor
-                .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
-                    id: "call-1".into(),
-                    kind: "function".into(),
-                    function: crate::sampling::types::ToolCallFunction::new(
-                        "search_replace",
-                        r#"{"file_path":"nope","old_string":"a","new_string":"b"}"#,
-                    ),
-                }])
+                .execute_tool_calls(
+                    vec![crate::sampling::types::ToolCallResponse {
+                        id: "call-1".into(),
+                        kind: "function".into(),
+                        function: crate::sampling::types::ToolCallFunction::new(
+                            "search_replace",
+                            r#"{"file_path":"nope","old_string":"a","new_string":"b"}"#,
+                        ),
+                    }],
+                    None,
+                )
                 .await
                 .unwrap_err();
 
@@ -184,14 +187,17 @@ async fn annotation_actor_rejects_mutating_shell_before_dispatch() {
                 }),
             ] {
                 let err = actor
-                    .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
-                        id: "call-shell-blocked".into(),
-                        kind: "function".into(),
-                        function: crate::sampling::types::ToolCallFunction::new(
-                            "run_terminal_cmd",
-                            arguments.to_string(),
-                        ),
-                    }])
+                    .execute_tool_calls(
+                        vec![crate::sampling::types::ToolCallResponse {
+                            id: "call-shell-blocked".into(),
+                            kind: "function".into(),
+                            function: crate::sampling::types::ToolCallFunction::new(
+                                "run_terminal_cmd",
+                                arguments.to_string(),
+                            ),
+                        }],
+                        None,
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(err.code, acp::Error::invalid_request().code);
@@ -235,14 +241,17 @@ async fn annotation_actor_dispatches_registered_read_file_tool() {
                 .expect("bind annotation read toolset");
 
             let outcome = actor
-                .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
-                    id: "call-read".into(),
-                    kind: "function".into(),
-                    function: crate::sampling::types::ToolCallFunction::new(
-                        "read_file",
-                        serde_json::json!({ "target_file": path }).to_string(),
-                    ),
-                }])
+                .execute_tool_calls(
+                    vec![crate::sampling::types::ToolCallResponse {
+                        id: "call-read".into(),
+                        kind: "function".into(),
+                        function: crate::sampling::types::ToolCallFunction::new(
+                            "read_file",
+                            serde_json::json!({ "target_file": path }).to_string(),
+                        ),
+                    }],
+                    None,
+                )
                 .await
                 .expect("registered annotation reader should dispatch");
             assert!(matches!(outcome, ToolLoop::Continue));
@@ -285,19 +294,22 @@ async fn annotation_actor_dispatches_registered_read_only_shell_command() {
                 .expect("bind annotation shell toolset");
 
             let outcome = actor
-                .execute_tool_calls(vec![crate::sampling::types::ToolCallResponse {
-                    id: "call-shell-read".into(),
-                    kind: "function".into(),
-                    function: crate::sampling::types::ToolCallFunction::new(
-                        "run_terminal_cmd",
-                        serde_json::json!({
-                            "command": "git diff --no-index /dev/null /dev/null && pwd",
-                            "description": "inspect a read-only diff and the current directory",
-                            "is_background": false
-                        })
-                        .to_string(),
-                    ),
-                }])
+                .execute_tool_calls(
+                    vec![crate::sampling::types::ToolCallResponse {
+                        id: "call-shell-read".into(),
+                        kind: "function".into(),
+                        function: crate::sampling::types::ToolCallFunction::new(
+                            "run_terminal_cmd",
+                            serde_json::json!({
+                                "command": "git diff --no-index /dev/null /dev/null && pwd",
+                                "description": "inspect a read-only diff and the current directory",
+                                "is_background": false
+                            })
+                            .to_string(),
+                        ),
+                    }],
+                    None,
+                )
                 .await
                 .expect("allowlisted annotation shell command should dispatch");
             assert!(matches!(outcome, ToolLoop::Continue));

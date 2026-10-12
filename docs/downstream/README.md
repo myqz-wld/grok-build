@@ -13,8 +13,8 @@ policy is:
 
 | Feature | Status | Upstream base | User documentation | Design / execution plan |
 |---|---|---|---|---|
-| Persistent threaded inline annotations | Maintained on `downstream/main` | `48271133` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
-| Responses Lite streamed completion fallback | Maintained on `downstream/main` | `48271133` | N/A | N/A |
+| Persistent threaded inline annotations | Maintained on `downstream/main` | `2bdd1d6a` | [Keyboard shortcuts: Inline Annotations](../../crates/codegen/xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md#inline-annotations-standard-tui) | [Inline annotations plan](plans/inline-annotations.md) |
+| Responses Lite streamed completion fallback | Maintained on `downstream/main` | `2bdd1d6a` | N/A | N/A |
 
 ### Responses Lite streamed completion fallback
 
@@ -53,10 +53,10 @@ does not recursively delete its child directory.
 
 ## Latest synchronization
 
-The 2026-09-15 integration includes upstream Grok 1.0.32 at `48271133`
-and is deployed locally.
-See the [sync and deployment record](plans/upstream-sync-20260915.md) for
-validation results, known upstream test limitations, and local deployment status.
+The 2026-10-11 integration includes upstream Grok 1.0.45 at `2bdd1d6a`
+and is undergoing validation before local deployment.
+See the [sync and deployment record](plans/upstream-sync-20261011.md) for
+validation results, upstream test limitations, and local deployment status.
 
 ## Upstream Synchronization Hotspots
 

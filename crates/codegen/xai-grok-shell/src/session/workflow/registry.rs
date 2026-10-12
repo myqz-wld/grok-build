@@ -16,10 +16,8 @@ pub(crate) struct BuiltinWorkflow {
 pub(crate) const BUILTIN_WORKFLOWS: &[BuiltinWorkflow] = &[BuiltinWorkflow {
     name: "deep-research",
     script: include_str!("../workflows/deep_research.rhai"),
-    path: concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/session/workflows/deep_research.rhai"
-    ),
+    // The script is embedded; its listing path must not expose the build machine.
+    path: "crates/codegen/xai-grok-shell/src/session/workflows/deep_research.rhai",
 }];
 
 pub(crate) struct ResolvedWorkflow {
@@ -277,7 +275,7 @@ fn is_compiled_in_builtin(name: &str) -> bool {
 }
 
 /// True only while the file is byte-identical to what the GCS bundle update wrote; an edited copy loses builtin privilege.
-fn bundled_file_is_managed(path: &Path) -> bool {
+pub(crate) fn bundled_file_is_managed(path: &Path) -> bool {
     let Some(workflows_dir) = path.parent() else {
         return false;
     };

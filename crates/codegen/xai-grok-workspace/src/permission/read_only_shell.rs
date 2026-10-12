@@ -78,10 +78,8 @@ fn tree_has_forbidden_syntax(root: Node<'_>) -> bool {
         ) {
             return true;
         }
-        for index in 0..node.child_count() {
-            if let Some(child) = node.child(index) {
-                stack.push(child);
-            }
+        for child in node.children(&mut node.walk()) {
+            stack.push(child);
         }
     }
     false
