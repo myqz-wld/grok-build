@@ -617,10 +617,11 @@ Manual smoke test in a standard TUI:
   (Grok 1.0.32) while retaining annotations and Responses Lite fallbacks.
   The detailed conflict resolutions, validation, deployment, and rollback
   status are in [the sync record](upstream-sync-20260915.md).
-- T12 upstream sync (2026-10-11): integrating `upstream/main@2bdd1d6a`
+- T12 upstream sync (2026-10-11): integrated `upstream/main@2bdd1d6a`
   (Grok 1.0.45), preserving annotations and Responses Lite fallbacks.
-  See [the sync record](upstream-sync-20261011.md) for current validation
-  and local installation progress.
-- Current state: T8–T11 are complete; T12 validation is in progress. The
-  previous Grok 1.0.32 installation remains active until release validation
-  succeeds.
+  See [the sync record](upstream-sync-20261011.md) for validation results,
+  upstream test limitations, installation, and rollback details.
+- Current state: T8–T12 are complete. Grok 1.0.45 (`4a8c90c62fd9`) is installed
+  locally with a verified Grok 1.0.32 backup. The standard/minimal and annotation
+  release PTY checks pass. The local downstream branch and pristine `main`
+  mirror contain the update; this delivery does not publish remote refs.

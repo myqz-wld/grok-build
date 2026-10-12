@@ -1,5 +1,13 @@
 # Upstream sync and local deployment — 2026-10-11
 
+## Outcome
+
+Completed local upstream integration and installation of
+`grok 1.0.45 (4a8c90c62fd9)`. The standard TUI, minimal TUI, and annotation
+creation/reload/follow-up checks pass against the actual release executable.
+The previous executable is independently backed up. Full-suite limitations
+are recorded below; no remote branches were pushed.
+
 ## Goal and scope
 
 Merge `upstream/main@2bdd1d6a` (Grok 1.0.45, six upstream sync commits)
@@ -7,6 +15,10 @@ into `downstream/main`, validate the maintained downstream behavior, and
 reinstall the local release through the existing executable aliases.
 The starting downstream commit is `89d3ecbb`; the previous upstream base
 is `48271133`. The checkout was clean before this task.
+
+Functional merge: `4a8c90c6` (parents `89d3ecbb` and `2bdd1d6a`).
+The pristine local `main` mirror is fast-forwarded to `2bdd1d6a`.
+Both branches remain local; no remote refs have been changed.
 
 ## Invariants and decisions
 
@@ -30,10 +42,10 @@ is `48271133`. The checkout was clean before this task.
 - [x] Fetch upstream and preview the merge (11 conflicted files).
 - [x] Resolve conflicts and inspect downstream integration hotspots.
 - [x] Validate formatting, compilation, downstream regressions, and relevant suites.
-- [ ] Commit integration and build the release from committed source.
-- [ ] Validate release standard/minimal TUI and annotation persistence/follow-up.
-- [ ] Preserve the old executable, install atomically, and verify aliases/version/hash.
-- [ ] Update feature ledger and delivery record; leave a clean downstream checkout.
+- [x] Commit integration and build the release from committed source.
+- [x] Validate release standard/minimal TUI and annotation persistence/follow-up.
+- [x] Preserve the old executable, install atomically, and verify aliases/version/hash.
+- [x] Update feature ledger and delivery record; leave a clean downstream checkout.
 
 ## Validation and risks
 
@@ -57,7 +69,12 @@ their current status and distinguish pre-existing limitations from regressions.
 | Read-only shell parser | 4 passed |
 | Shell lib suite | 7052 passed, 11 failed, 5 ignored |
 | Workspace lib suite | 2087 passed, 7 failed |
-| Release build and PTY validation | Pending |
+| Release build from `4a8c90c6` | Passed |
+| Release standard TUI welcome/quit | Passed |
+| Release minimal Ctrl+C confirmation/quit | Passed |
+| Release annotation creation/reload/follow-up | Passed |
+| Binary signature and personal-path scan | Passed |
+| Shell integration/binary targets with `test-support` | 38 targets: 134 passed, 2 failed, 3 ignored |
 
 The public upstream tree still omits `docs/internal/25-enterprise.md` and
 `docs/internal/22-environment-variables.md`, which are compile-time inputs to
@@ -87,9 +104,16 @@ Grove fallback-reason expectation (one). The image case passes with a canonical
 temporary directory; the other six reproduce serially. The failing modules
 match upstream. The downstream read-only parser tests all pass.
 
+Two shell integration cases fail in unchanged upstream tests. The config-write
+flock test enumerates Linux `/proc/self/fd`, unavailable on macOS. The plugin
+policy test expects a pinning-policy refusal for a project MCP server, but the
+project server is not discovered under the current trust gate. Other eligible
+integration targets complete, using the new release through `GROK_BINARY`,
+`GROK_BINARY_LEADER`, and `GROK_BINARY_CLIENT` with a canonical temporary directory.
+
 These full-suite limits remain visible; they are not represented as passing
-checks. Actual release standard/minimal/annotation PTY checks are required
-before replacing the installed executable.
+checks. Actual release standard/minimal/annotation PTY checks passed before
+the installed executable was replaced.
 
 ## Integration details
 
@@ -123,5 +147,30 @@ The updated historical annotation plan now uses repository-relative or portable
 paths in place of personal absolute paths. This cleans current files only;
 published and local historical commits are not rewritten.
 
-No unresolved user decisions. Next action: complete compilation and regression
-validation, then build and install the committed release.
+## Deployment and rollback
+
+- Entry point: `$HOME/.local/bin/grok -> $HOME/.grok/bin/grok`.
+- Both `$HOME/.grok/bin/grok` and `$HOME/.grok/bin/agent` point to
+  `../downloads/grok-1.0.45-macos-aarch64-downstream-4a8c90c62fd9`.
+- Installed artifact SHA-256:
+  `62a4e0577d961a0745c68250000e87b06ba407f7606cba0bd545c17fc176a164`.
+- Previous executable: `grok 1.0.32 (be4bb23da4c2)`.
+- Independent backup: `$HOME/.grok/backups/grok-1.0.32-be4bb23da4c2-20261011`.
+- Backup SHA-256:
+  `2c9d9e1ad47619109551bb7b2a590e10e7bb213fb02a932988642473633ecc0f`.
+
+The release was built with `GROK_VERSION=1.0.45`, Rust/C/C++ source-path
+remapping, and `cargo build --locked -p xai-grok-pager-bin --release` using
+`target/install` as the target directory. Signature validation and checks for
+personal paths and available sensitive environment values passed. Remaining
+generic home-path examples in embedded documentation are synthetic.
+
+Installation checked the staged executable and independent backup hashes,
+replaced each inner alias atomically, and verified the reported version and
+hash through all three entry points. Existing configuration and sessions were
+preserved; no Agent Deck process or application bundle was restarted or replaced.
+Rollback can point both inner aliases to the independent backup while keeping
+the outer entry point. Temporary diagnostics remain private and are not part
+of the installed artifact or repository.
+
+No unresolved user decisions or remaining delivery actions.

@@ -54,7 +54,7 @@ does not recursively delete its child directory.
 ## Latest synchronization
 
 The 2026-10-11 integration includes upstream Grok 1.0.45 at `2bdd1d6a`
-and is undergoing validation before local deployment.
+and is deployed locally as `grok 1.0.45 (4a8c90c62fd9)`.
 See the [sync and deployment record](plans/upstream-sync-20261011.md) for
 validation results, upstream test limitations, and local deployment status.
 
